@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+data/evidence/
+data/cctv.db
+data/cctv.db-journal
+data/calibration/
+runs/
+models/*.pt
+models/*.onnx
+models/*.engine
+!models/.gitkeep
+.idea/
+.vscode/

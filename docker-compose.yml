@@ -1,0 +1,33 @@
+services:
+  pipeline:
+    build: .
+    image: cctv-enforcement:latest
+    container_name: cctv-pipeline
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config
+      - ./models:/app/models
+      - ./data:/app/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: ["python", "scripts/run_pipeline.py"]
+
+  api:
+    image: cctv-enforcement:latest
+    container_name: cctv-api
+    restart: unless-stopped
+    depends_on:
+      - pipeline
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+    command: ["python", "scripts/run_api.py"]

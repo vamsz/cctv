@@ -1,0 +1,34 @@
+# Tunable parameters for the violation rules engine.
+# Keep all magic numbers here so police/ops can adjust without code changes.
+
+helmet:
+  enabled: true
+  # A "rider" track must be observed without a helmet for at least this many
+  # consecutive frames before the rule fires. Prevents single-frame flickers.
+  min_consecutive_no_helmet_frames: 8
+  # Minimum IoU between a person box and a 2-wheeler box to call them a rider.
+  rider_match_iou: 0.05
+  # Minimum confidence for the helmet detector head.
+  helmet_conf: 0.45
+
+red_light:
+  enabled: true
+  # The signal must be classified RED for at least this many frames before
+  # the rule starts evaluating crossings (debounce).
+  red_debounce_frames: 5
+  # A track is considered to have crossed the stop line if its previous
+  # frame was on the lawful side and the current frame is past it, while
+  # moving in the lawful direction.
+  min_speed_px_per_frame: 1.5
+  # Cooldown so we don't fire twice for the same vehicle.
+  per_track_cooldown_seconds: 30
+
+plate_unreadable:
+  enabled: true
+  # Fire only when the vehicle has been tracked through the enforcement zone
+  # for at least this many frames AND no plate read ever cleared the
+  # OCR_AUTO_ACCEPT threshold.
+  min_track_frames: 25
+  # Skip very small/distant detections — they're naturally unreadable and
+  # would produce useless evidence.
+  min_plate_pixel_area: 800

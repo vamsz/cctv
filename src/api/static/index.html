@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CCTV Enforcement Review</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --border:#2d333b; --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950; --bad:#f85149; --warn:#d29922;}
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--fg); }
+  header { padding: 14px 20px; border-bottom: 1px solid var(--border); display:flex; align-items:center; justify-content:space-between; }
+  h1 { margin:0; font-size: 16px; font-weight: 600; }
+  .stats { display:flex; gap: 18px; font-size: 13px; color: var(--muted);}
+  .stats b { color: var(--fg); }
+  .filters { padding: 12px 20px; display:flex; gap:8px; flex-wrap: wrap; border-bottom: 1px solid var(--border); align-items:center; }
+  select, input { background: var(--panel); color: var(--fg); border: 1px solid var(--border); padding: 6px 10px; border-radius: 6px; font: inherit; }
+  button { background: var(--panel); color: var(--fg); border: 1px solid var(--border); padding: 6px 12px; border-radius: 6px; cursor:pointer; font: inherit; }
+  button.primary { background: var(--accent); color:#000; border-color: var(--accent); }
+  button.danger  { background: var(--bad); color:#000; border-color: var(--bad); }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 16px; padding: 16px 20px; }
+  .card { background: var(--panel); border:1px solid var(--border); border-radius: 10px; overflow:hidden; display:flex; flex-direction:column; }
+  .card .img { aspect-ratio: 16/9; background:#000; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+  .card .img img { width:100%; height:100%; object-fit: cover; }
+  .card .meta { padding: 10px 12px; font-size: 13px; }
+  .card .row { display:flex; justify-content:space-between; gap: 8px; }
+  .pill { display:inline-block; padding: 1px 8px; border-radius: 999px; font-size:11px; font-weight:600; }
+  .pill.no_helmet { background:#3d1212; color:#ff8a80; }
+  .pill.red_light_jump { background:#3d2812; color:#ffb74d; }
+  .pill.plate_unreadable { background:#1a2c3d; color:#7fbcff; }
+  .pill.pending { background:#3d3a12; color:#fde047; }
+  .pill.approved { background:#13351b; color:#7ee787; }
+  .pill.rejected { background:#3d1212; color:#ff8a80; }
+  .actions { padding: 8px 12px; border-top:1px solid var(--border); display:flex; gap:8px; }
+  .plate-crop { max-height: 80px; background:#000; padding: 2px; border-radius: 6px; }
+  .muted { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CCTV Enforcement Review</h1>
+  <div class="stats" id="stats"></div>
+</header>
+
+<div class="filters">
+  <select id="status">
+    <option value="pending" selected>Pending review</option>
+    <option value="approved">Approved</option>
+    <option value="rejected">Rejected</option>
+    <option value="">All statuses</option>
+  </select>
+  <select id="code">
+    <option value="">All violations</option>
+    <option value="no_helmet">No helmet</option>
+    <option value="red_light_jump">Red-light jump</option>
+    <option value="plate_unreadable">Plate unreadable</option>
+  </select>
+  <input id="camera" placeholder="Camera ID"/>
+  <input id="plate" placeholder="Plate (e.g. TS09)"/>
+  <button id="apply" class="primary">Apply</button>
+  <span class="muted" id="count"></span>
+</div>
+
+<div class="grid" id="grid"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const grid = $("#grid");
+
+async function loadStats() {
+  const r = await fetch('/api/stats');
+  const s = await r.json();
+  $('#stats').innerHTML = `
+    <span>Total: <b>${s.total}</b></span>
+    <span>Pending: <b style="color:var(--warn)">${s.pending}</b></span>
+    <span>Approved: <b style="color:var(--ok)">${s.approved}</b></span>
+    <span>Rejected: <b style="color:var(--bad)">${s.rejected}</b></span>
+  `;
+}
+
+async function loadList() {
+  const params = new URLSearchParams();
+  const st = $('#status').value;
+  if (st) params.set('status', st);
+  if ($('#code').value) params.set('code', $('#code').value);
+  if ($('#camera').value) params.set('camera_id', $('#camera').value);
+  if ($('#plate').value) params.set('plate', $('#plate').value);
+  params.set('limit', '60');
+  const r = await fetch('/api/violations?' + params);
+  const items = await r.json();
+  $('#count').textContent = `${items.length} shown`;
+  grid.innerHTML = items.map(card).join('');
+  for (const btn of document.querySelectorAll('button[data-act]')) {
+    btn.addEventListener('click', onAction);
+  }
+}
+
+function card(v) {
+  const ts = new Date(v.timestamp + 'Z').toLocaleString();
+  const img = v.annotated_url || v.frame_url;
+  const plateImg = v.plate_crop_url
+    ? `<img class="plate-crop" src="${v.plate_crop_url}" alt="plate">`
+    : '<span class="muted">no plate crop</span>';
+  return `
+    <div class="card" data-id="${v.id}">
+      <div class="img"><img src="${img}" alt=""></div>
+      <div class="meta">
+        <div class="row"><span class="pill ${v.code}">${v.code}</span><span class="pill ${v.status}">${v.status}</span></div>
+        <div class="row" style="margin-top:6px"><b>${v.plate_text || '—'}</b><span class="muted">${(v.plate_ocr_confidence||0).toFixed(2)}</span></div>
+        <div class="row"><span class="muted">${v.camera_id} · track #${v.track_id}</span><span class="muted">${ts}</span></div>
+        <div style="margin-top:8px">${plateImg}</div>
+      </div>
+      <div class="actions">
+        <button class="primary" data-act="approve" data-id="${v.id}">Approve</button>
+        <button class="danger" data-act="reject" data-id="${v.id}">Reject</button>
+      </div>
+    </div>
+  `;
+}
+
+async function onAction(e) {
+  const id = e.currentTarget.dataset.id;
+  const act = e.currentTarget.dataset.act;
+  const reviewer = prompt('Reviewer ID/name?', 'operator');
+  if (!reviewer) return;
+  const notes = act === 'reject' ? prompt('Reason (optional)?') || '' : '';
+  await fetch(`/api/violations/${id}/${act}`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify({ reviewer, notes }),
+  });
+  await loadStats();
+  await loadList();
+}
+
+$('#apply').addEventListener('click', loadList);
+loadStats(); loadList();
+setInterval(loadStats, 5000);
+</script>
+</body>
+</html>

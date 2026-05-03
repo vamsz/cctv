@@ -1,0 +1,41 @@
+# One entry per camera. The pipeline runs one process per camera.
+#
+# `source` accepts anything OpenCV's VideoCapture accepts:
+#   - rtsp://user:pass@host:554/Streaming/Channels/101  (most CCTV NVRs)
+#   - http://host/mjpeg  (some IP cameras)
+#   - /path/to/file.mp4  (good for offline test drives)
+#   - 0  (local webcam, integer)
+#
+# `stop_line` is a polyline in pixel coordinates of the source frame.
+# Points are [x, y] pairs. Used by the red-light rule.
+#
+# `signal_roi` is a bounding box [x1, y1, x2, y2] cropping the traffic
+# light face. The signal-state classifier reads only this region.
+#
+# `direction` is the lawful travel direction across the stop line, as a
+# unit vector [dx, dy] in image space. The red-light rule fires only when
+# a tracked vehicle crosses the line moving in this direction during red.
+#
+# Coordinates depend on the specific camera mount, so the values below are
+# placeholders. After you point the system at a real camera, run
+# `python scripts/calibrate.py --camera CAM01` to draw the polygons on a
+# still frame and dump the YAML.
+
+cameras:
+  - id: CAM01
+    name: "Hyderabad - Punjagutta Junction (north approach)"
+    source: "rtsp://user:pass@192.168.1.10:554/Streaming/Channels/101"
+    fps_cap: 15
+    stop_line: [[100, 600], [1820, 600]]      # placeholder
+    signal_roi: [1500, 80, 1620, 280]          # placeholder
+    direction: [0.0, -1.0]                      # placeholder: vehicles travel "up" the frame
+    enabled: true
+
+  - id: SAMPLE
+    name: "Local sample video for offline test"
+    source: "./data/samples/traffic.mp4"
+    fps_cap: 15
+    stop_line: [[100, 500], [1180, 500]]
+    signal_roi: [1080, 50, 1180, 200]
+    direction: [0.0, -1.0]
+    enabled: false

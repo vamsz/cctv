@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+.venv
+venv
+data/evidence
+data/cctv.db*
+data/calibration
+runs/
+.git
+.idea
+.vscode
+*.egg-info
