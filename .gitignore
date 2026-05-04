@@ -14,3 +14,11 @@ models/*.engine
 !models/.gitkeep
 .idea/
 .vscode/
+
+# Ignored generated files
+*.mp4
+*.log
+data/debug_crops/
+data/*.key
+data/*.pub
+raw

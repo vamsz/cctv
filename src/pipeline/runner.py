@@ -249,6 +249,10 @@ def _crop(frame: np.ndarray, xyxy: tuple[float, float, float, float]) -> np.ndar
 
 class PipelineOrchestrator:
     def __init__(self):
+        from src.common.db import engine
+        from src.evidence.models import Base
+        Base.metadata.create_all(bind=engine())
+
         self.detector = Detector(
             general_weights=settings.detector_weights,
             helmet_weights=settings.helmet_weights,
@@ -257,7 +261,7 @@ class PipelineOrchestrator:
             conf=settings.det_conf,
         )
         self.ocr = PlateOCR(lang=settings.ocr_lang, use_gpu=settings.device.startswith("cuda"))
-        self.store = EvidenceStore(database_url=settings.database_url, evidence_dir=settings.evidence_dir)
+        self.store = EvidenceStore()
         self.rule_params = load_rules(settings.rules_yaml)
         self.cameras = load_cameras(settings.cameras_yaml)
         self.pipelines: list[CameraPipeline] = []

@@ -104,7 +104,7 @@ class Detector:
                 clses = res.boxes.cls.cpu().numpy().astype(int)
                 for box, c, k in zip(xyxy, confs, clses):
                     label = names[int(k)].lower()
-                    if "no" in label and "helmet" in label:
+                    if ("no" in label or "without" in label) and "helmet" in label:
                         cls = ObjectClass.NO_HELMET
                     elif "helmet" in label:
                         cls = ObjectClass.HELMET

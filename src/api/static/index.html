@@ -32,6 +32,8 @@
   .actions { padding: 8px 12px; border-top:1px solid var(--border); display:flex; gap:8px; }
   .plate-crop { max-height: 80px; background:#000; padding: 2px; border-radius: 6px; }
   .muted { color: var(--muted); font-size: 12px; }
+  .conf-bar { height:4px; border-radius:2px; margin-top:4px; }
+  .empty { text-align:center; padding:60px 20px; color:var(--muted); font-size:15px; }
 </style>
 </head>
 <body>
@@ -63,34 +65,51 @@
 
 <script>
 const $ = (s) => document.querySelector(s);
-const grid = $("#grid");
+const grid = document.getElementById('grid');
 
 async function loadStats() {
-  const r = await fetch('/api/stats');
-  const s = await r.json();
-  $('#stats').innerHTML = `
-    <span>Total: <b>${s.total}</b></span>
-    <span>Pending: <b style="color:var(--warn)">${s.pending}</b></span>
-    <span>Approved: <b style="color:var(--ok)">${s.approved}</b></span>
-    <span>Rejected: <b style="color:var(--bad)">${s.rejected}</b></span>
-  `;
+  try {
+    const r = await fetch('/api/stats');
+    if (!r.ok) return;
+    const s = await r.json();
+    document.getElementById('stats').innerHTML = `
+      <span>Total: <b>${s.total}</b></span>
+      <span>Pending: <b style="color:var(--warn)">${s.pending}</b></span>
+      <span>Approved: <b style="color:var(--ok)">${s.approved}</b></span>
+      <span>Rejected: <b style="color:var(--bad)">${s.rejected}</b></span>
+      <span>Last 24h: <b>${s.last_24h}</b></span>
+    `;
+  } catch(e) { console.error('stats error', e); }
 }
 
 async function loadList() {
-  const params = new URLSearchParams();
-  const st = $('#status').value;
-  if (st) params.set('status', st);
-  if ($('#code').value) params.set('code', $('#code').value);
-  if ($('#camera').value) params.set('camera_id', $('#camera').value);
-  if ($('#plate').value) params.set('plate', $('#plate').value);
-  params.set('limit', '60');
-  const r = await fetch('/api/violations?' + params);
-  const items = await r.json();
-  $('#count').textContent = `${items.length} shown`;
-  grid.innerHTML = items.map(card).join('');
-  for (const btn of document.querySelectorAll('button[data-act]')) {
-    btn.addEventListener('click', onAction);
-  }
+  try {
+    const params = new URLSearchParams();
+    const st = $('#status').value;
+    if (st) params.set('status', st);
+    if ($('#code').value) params.set('code', $('#code').value);
+    if ($('#camera').value) params.set('camera_id', $('#camera').value);
+    if ($('#plate').value) params.set('plate', $('#plate').value);
+    params.set('limit', '60');
+    const r = await fetch('/api/violations?' + params);
+    if (!r.ok) { grid.innerHTML = '<div class="empty">API error — is the server running?</div>'; return; }
+    const items = await r.json();
+    $('#count').textContent = items.length + ' shown';
+    if (items.length === 0) {
+      grid.innerHTML = '<div class="empty">No violations found.</div>';
+      return;
+    }
+    grid.innerHTML = items.map(card).join('');
+    for (const btn of document.querySelectorAll('button[data-act]')) {
+      btn.addEventListener('click', onAction);
+    }
+  } catch(e) { console.error('list error', e); grid.innerHTML = '<div class="empty">Failed to load — check console.</div>'; }
+}
+
+function confColor(c) {
+  if (c >= 0.8) return 'var(--ok)';
+  if (c >= 0.5) return 'var(--warn)';
+  return 'var(--bad)';
 }
 
 function card(v) {
@@ -99,19 +118,26 @@ function card(v) {
   const plateImg = v.plate_crop_url
     ? `<img class="plate-crop" src="${v.plate_crop_url}" alt="plate">`
     : '<span class="muted">no plate crop</span>';
+  const conf = v.rule_confidence || 0;
+  const ocrConf = v.plate_ocr_confidence || 0;
+  const isPending = v.status === 'pending';
   return `
     <div class="card" data-id="${v.id}">
-      <div class="img"><img src="${img}" alt=""></div>
+      <div class="img"><img src="${img}" alt="" loading="lazy"></div>
       <div class="meta">
-        <div class="row"><span class="pill ${v.code}">${v.code}</span><span class="pill ${v.status}">${v.status}</span></div>
-        <div class="row" style="margin-top:6px"><b>${v.plate_text || '—'}</b><span class="muted">${(v.plate_ocr_confidence||0).toFixed(2)}</span></div>
+        <div class="row"><span class="pill ${v.code}">${v.code.replace(/_/g,' ')}</span><span class="pill ${v.status}">${v.status}</span></div>
+        <div class="conf-bar" style="width:${(conf*100).toFixed(0)}%; background:${confColor(conf)}" title="Rule confidence: ${(conf*100).toFixed(1)}%"></div>
+        <div class="row" style="margin-top:6px">
+          <b>${v.plate_text || '—'}</b>
+          <span class="muted">OCR ${(ocrConf*100).toFixed(0)}% · Rule ${(conf*100).toFixed(0)}%</span>
+        </div>
         <div class="row"><span class="muted">${v.camera_id} · track #${v.track_id}</span><span class="muted">${ts}</span></div>
         <div style="margin-top:8px">${plateImg}</div>
       </div>
-      <div class="actions">
+      ${isPending ? `<div class="actions">
         <button class="primary" data-act="approve" data-id="${v.id}">Approve</button>
         <button class="danger" data-act="reject" data-id="${v.id}">Reject</button>
-      </div>
+      </div>` : ''}
     </div>
   `;
 }
@@ -119,19 +145,22 @@ function card(v) {
 async function onAction(e) {
   const id = e.currentTarget.dataset.id;
   const act = e.currentTarget.dataset.act;
-  const reviewer = prompt('Reviewer ID/name?', 'operator');
-  if (!reviewer) return;
-  const notes = act === 'reject' ? prompt('Reason (optional)?') || '' : '';
-  await fetch(`/api/violations/${id}/${act}`, {
-    method: 'POST',
-    headers: {'content-type': 'application/json'},
-    body: JSON.stringify({ reviewer, notes }),
-  });
+  const notes = act === 'reject' ? (prompt('Rejection reason (optional)?') || '') : '';
+  try {
+    const r = await fetch('/api/violations/' + id + '/' + act, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({ notes: notes || null }),
+    });
+    if (!r.ok) { const err = await r.json(); alert(err.detail || 'Error'); return; }
+  } catch(e) { alert('Network error'); return; }
   await loadStats();
   await loadList();
 }
 
 $('#apply').addEventListener('click', loadList);
+$('#status').addEventListener('change', loadList);
+$('#code').addEventListener('change', loadList);
 loadStats(); loadList();
 setInterval(loadStats, 5000);
 </script>

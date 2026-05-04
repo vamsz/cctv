@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/test_video.py --video \"C:/Users/vamsi/OneDrive/Desktop/istockphoto-866517852-640_adpp_is.mp4\" --device cpu --no-display --save data/output_test.mp4)",
+      "Bash(pip install *)",
+      "Bash(rm -f data/output_test.mp4 data/run.log)",
+      "Bash(python -u scripts/test_video.py --video \"C:/Users/vamsi/OneDrive/Desktop/istockphoto-866517852-640_adpp_is.mp4\" --device cpu --no-display --save data/output_test.mp4)",
+      "Bash(echo \"started pid=$!\")",
+      "Bash(tee data/run.log)",
+      "Bash(python -c ' *)",
+      "Bash(python -u scripts/test_video.py --video \"C:/Users/vamsi/OneDrive/Desktop/istockphoto-866517852-640_adpp_is.mp4\" --device cpu --no-display --save data/output_test.mp4 --every-n 3)",
+      "Bash(awk '{print $1, $2}')",
+      "PowerShell(Get-Process python -ErrorAction SilentlyContinue)",
+      "PowerShell(Stop-Process -Force -ErrorAction SilentlyContinue)",
+      "Bash(python -u scripts/test_video.py --video \"C:/Users/vamsi/OneDrive/Desktop/istockphoto-866517852-640_adpp_is.mp4\" --device cpu --no-display --save data/output_test.mp4 --max-frames 30 --debug-crops)",
+      "Bash(python -u scripts/test_ocr.py --synthetic)",
+      "Bash(rm -f data/cctv.db)",
+      "Bash(python scripts/seed_demo.py)",
+      "Bash(python scripts/run_api.py)",
+      "Bash(tee data/api.log)",
+      "Bash(curl -s http://localhost:8000/healthz)",
+      "Bash(curl -s http://localhost:8000/api/stats)",
+      "Bash(curl -s \"http://localhost:8000/api/violations?limit=3\")",
+      "Bash(python -m json.tool)",
+      "Bash(curl -s http://localhost:8000/api/cameras)",
+      "Bash(curl -s -o /tmp/test_evidence.jpg -w \"HTTP %{http_code} bytes=%{size_download} type=%{content_type}\\\\n\" \"http://localhost:8000/api/evidence/CAM01/2026-05-04/224111181036_no_helmet_t107_frame.jpg\")",
+      "Bash(curl -s -X POST -H \"content-type: application/json\" -d '{\"notes\":\"verified\"}' \"http://localhost:8000/api/violations/1/approve\")",
+      "Bash(python -u scripts/test_video.py --video \"C:/Users/vamsi/OneDrive/Desktop/153283-804933523.mp4\" --device cpu --no-display --save data/output_test.mp4 --every-n 5 --debug-crops)"
+    ]
+  }
+}
