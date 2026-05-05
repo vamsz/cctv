@@ -1,27 +1,43 @@
-"""FastAPI review console — no auth, focus on working product.
+"""FastAPI enforcement review console.
 
 Endpoints:
-  GET  /api/violations         list with filters
-  GET  /api/violations/{id}    single violation
+  POST /auth/login                login → JWT
+  GET  /api/violations            list with filters
+  GET  /api/violations/{id}       single violation
   POST /api/violations/{id}/approve
   POST /api/violations/{id}/reject
   POST /api/violations/bulk_approve
   POST /api/violations/bulk_reject
-  GET  /api/evidence/{key}     serve evidence images
-  GET  /api/stats              dashboard stats
-  GET  /api/cameras            camera health
-  GET  /healthz                liveness probe
-  GET  /                       review dashboard UI
+  GET  /api/evidence/{key}        serve evidence images
+  GET  /api/stats                 dashboard stats
+  GET  /api/cameras               camera health
+  GET  /api/watchlist             list watchlist entries
+  POST /api/watchlist             add entry (admin/supervisor)
+  DELETE /api/watchlist/{id}      remove entry (admin/supervisor)
+  POST /api/alert-engine/toggle   enable/disable global kill-switch
+  GET  /api/device                GPU/CPU info
+  WS   /ws/events                 real-time violation push
+  GET  /healthz                   liveness probe
+  GET  /                          review dashboard UI
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -29,17 +45,20 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from config.settings import settings
+from src.api.deps import current_user, rate_limit, require_role
 from src.common.db import session_scope
 from src.common.logging import configure_logging, get_logger
 from src.common.metrics import review_action_total, review_backlog, start_metrics_server
 from src.common.object_store import get_object_store
-from src.evidence.models import Base, CameraHealth, Violation
+from src.common.security import hash_password, issue_jwt, verify_password, JWTError, verify_jwt
+from src.evidence.models import Base, CameraHealth, User, Violation, WatchlistEntry
 from src.evidence.store import ReviewStatus
+from src.rules import watchlist as wl
 
 configure_logging()
 log = get_logger("api")
 
-app = FastAPI(title="CCTV Enforcement Review", version="1.0.0", docs_url="/api/docs", redoc_url=None)
+app = FastAPI(title="CCTV Enforcement Review", version="2.0.0", docs_url="/api/docs", redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,8 +71,46 @@ app.add_middleware(
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+# ---- shared broadcast queue for WebSocket clients --------------------------
+_ws_clients: list[asyncio.Queue] = []
+_ws_lock = asyncio.Lock()
+
+
+async def _broadcast(payload: dict) -> None:
+    async with _ws_lock:
+        dead = []
+        for q in _ws_clients:
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                dead.append(q)
+        for q in dead:
+            _ws_clients.remove(q)
+
+
+def push_violation_event(payload: dict) -> None:
+    """Called from pipeline thread to broadcast a new violation to WS clients."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(_broadcast(payload), loop)
+    except Exception:
+        pass
+
 
 # ----------------------------------------------------------------- schemas
+
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    role: str
+    full_name: Optional[str]
 
 
 class ReviewIn(BaseModel):
@@ -82,6 +139,7 @@ class ViolationOut(BaseModel):
     review_notes: Optional[str]
     sha256: str
     chain_hash: str
+    extras: Optional[dict]
 
 
 class CameraOut(BaseModel):
@@ -101,6 +159,19 @@ class StatsOut(BaseModel):
     by_code: dict[str, int]
     by_camera: dict[str, int]
     last_24h: int
+
+
+class WatchlistIn(BaseModel):
+    plate_pattern: str = Field(min_length=2, max_length=32)
+    reason: Optional[str] = Field(default=None, max_length=512)
+
+
+class WatchlistOut(BaseModel):
+    id: int
+    plate_pattern: str
+    reason: Optional[str]
+    added_at: datetime
+    is_active: bool
 
 
 # ----------------------------------------------------------------- helpers
@@ -126,7 +197,23 @@ def _to_out(v: Violation) -> ViolationOut:
         review_notes=v.review_notes,
         sha256=v.sha256,
         chain_hash=v.chain_hash,
+        extras=v.extras,
     )
+
+
+# ----------------------------------------------------------------- auth
+
+
+@app.post("/auth/login", response_model=TokenOut)
+def login(body: LoginIn, request: Request):
+    with session_scope() as s:
+        user = s.scalar(select(User).where(User.email == body.email.lower()))
+        if not user or not user.is_active or not verify_password(body.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="invalid credentials")
+        user.last_login_at = datetime.utcnow()
+        s.flush()
+        token = issue_jwt(user.email, user.role, {"name": user.full_name})
+        return TokenOut(access_token=token, role=user.role, full_name=user.full_name)
 
 
 # ----------------------------------------------------------------- violations
@@ -141,6 +228,7 @@ def list_violations(
     since: Optional[datetime] = None,
     limit: int = Query(default=50, le=500),
     offset: int = 0,
+    _: None = Depends(rate_limit),
 ):
     with session_scope() as s:
         stmt = select(Violation).order_by(Violation.timestamp.desc())
@@ -168,26 +256,40 @@ def get_violation(vid: int):
 
 
 @app.post("/api/violations/{vid}/approve", response_model=ViolationOut)
-def approve(vid: int, body: ReviewIn):
-    return _set_status(vid, ReviewStatus.APPROVED, body)
+def approve(
+    vid: int,
+    body: ReviewIn,
+    user: User = Depends(require_role("admin", "supervisor", "reviewer")),
+):
+    return _set_status(vid, ReviewStatus.APPROVED, body, actor=user)
 
 
 @app.post("/api/violations/{vid}/reject", response_model=ViolationOut)
-def reject(vid: int, body: ReviewIn):
-    return _set_status(vid, ReviewStatus.REJECTED, body)
+def reject(
+    vid: int,
+    body: ReviewIn,
+    user: User = Depends(require_role("admin", "supervisor", "reviewer")),
+):
+    return _set_status(vid, ReviewStatus.REJECTED, body, actor=user)
 
 
 @app.post("/api/violations/bulk_approve")
-def bulk_approve(body: BulkReviewIn):
-    return _bulk(body, ReviewStatus.APPROVED)
+def bulk_approve(
+    body: BulkReviewIn,
+    user: User = Depends(require_role("admin", "supervisor", "reviewer")),
+):
+    return _bulk(body, ReviewStatus.APPROVED, actor=user)
 
 
 @app.post("/api/violations/bulk_reject")
-def bulk_reject(body: BulkReviewIn):
-    return _bulk(body, ReviewStatus.REJECTED)
+def bulk_reject(
+    body: BulkReviewIn,
+    user: User = Depends(require_role("admin", "supervisor", "reviewer")),
+):
+    return _bulk(body, ReviewStatus.REJECTED, actor=user)
 
 
-def _set_status(vid: int, target: ReviewStatus, body: ReviewIn) -> ViolationOut:
+def _set_status(vid: int, target: ReviewStatus, body: ReviewIn, actor: Optional[User] = None) -> ViolationOut:
     with session_scope() as s:
         v = s.get(Violation, vid)
         if not v:
@@ -197,12 +299,14 @@ def _set_status(vid: int, target: ReviewStatus, body: ReviewIn) -> ViolationOut:
         v.status = target.value
         v.reviewed_at = datetime.utcnow()
         v.review_notes = body.notes
+        if actor:
+            v.reviewer_id = actor.id
         s.flush()
         review_action_total.labels(action=target.value).inc()
         return _to_out(v)
 
 
-def _bulk(body: BulkReviewIn, target: ReviewStatus) -> dict:
+def _bulk(body: BulkReviewIn, target: ReviewStatus, actor: Optional[User] = None) -> dict:
     if not body.ids:
         return {"updated": 0}
     with session_scope() as s:
@@ -214,12 +318,14 @@ def _bulk(body: BulkReviewIn, target: ReviewStatus) -> dict:
             v.status = target.value
             v.reviewed_at = datetime.utcnow()
             v.review_notes = body.notes
+            if actor:
+                v.reviewer_id = actor.id
             review_action_total.labels(action=target.value).inc()
             updated += 1
     return {"updated": updated}
 
 
-# ----------------------------------------------------------------- evidence streaming
+# ----------------------------------------------------------------- evidence
 
 
 @app.get("/api/evidence/{key:path}")
@@ -242,13 +348,19 @@ def stats():
         approved = s.scalar(select(func.count(Violation.id)).where(Violation.status == "approved")) or 0
         rejected = s.scalar(select(func.count(Violation.id)).where(Violation.status == "rejected")) or 0
         last_24h = s.scalar(
-            select(func.count(Violation.id)).where(Violation.timestamp >= datetime.utcnow() - timedelta(hours=24))
+            select(func.count(Violation.id)).where(
+                Violation.timestamp >= datetime.utcnow() - timedelta(hours=24)
+            )
         ) or 0
         by_code = dict(s.execute(select(Violation.code, func.count(Violation.id)).group_by(Violation.code)).all())
-        by_camera = dict(s.execute(select(Violation.camera_id, func.count(Violation.id)).group_by(Violation.camera_id)).all())
+        by_camera = dict(
+            s.execute(select(Violation.camera_id, func.count(Violation.id)).group_by(Violation.camera_id)).all()
+        )
         review_backlog.set(pending)
-        return StatsOut(total=total, pending=pending, approved=approved, rejected=rejected,
-                        by_code=by_code, by_camera=by_camera, last_24h=last_24h)
+        return StatsOut(
+            total=total, pending=pending, approved=approved, rejected=rejected,
+            by_code=by_code, by_camera=by_camera, last_24h=last_24h,
+        )
 
 
 @app.get("/api/cameras", response_model=list[CameraOut])
@@ -256,11 +368,161 @@ def cameras():
     with session_scope() as s:
         rows = s.scalars(select(CameraHealth)).all()
         return [
-            CameraOut(camera_id=r.camera_id, is_up=r.is_up, last_frame_at=r.last_frame_at,
-                      last_violation_at=r.last_violation_at, fps_observed=r.fps_observed,
-                      last_error=r.last_error)
+            CameraOut(
+                camera_id=r.camera_id, is_up=r.is_up, last_frame_at=r.last_frame_at,
+                last_violation_at=r.last_violation_at, fps_observed=r.fps_observed, last_error=r.last_error,
+            )
             for r in rows
         ]
+
+
+# ----------------------------------------------------------------- watchlist
+
+
+@app.get("/api/watchlist", response_model=list[WatchlistOut])
+def list_watchlist(_: User = Depends(require_role("admin", "supervisor", "reviewer", "viewer"))):
+    with session_scope() as s:
+        rows = s.scalars(select(WatchlistEntry).where(WatchlistEntry.is_active == True)).all()
+        return [WatchlistOut(id=r.id, plate_pattern=r.plate_pattern, reason=r.reason,
+                             added_at=r.added_at, is_active=r.is_active) for r in rows]
+
+
+@app.post("/api/watchlist", response_model=WatchlistOut, status_code=201)
+def add_watchlist(
+    body: WatchlistIn,
+    user: User = Depends(require_role("admin", "supervisor")),
+):
+    pattern = body.plate_pattern.upper().strip()
+    with session_scope() as s:
+        existing = s.scalar(select(WatchlistEntry).where(WatchlistEntry.plate_pattern == pattern))
+        if existing:
+            existing.is_active = True
+            existing.reason = body.reason
+            s.flush()
+            wl.add_entry(pattern, body.reason or "")
+            return WatchlistOut(id=existing.id, plate_pattern=existing.plate_pattern,
+                                reason=existing.reason, added_at=existing.added_at, is_active=True)
+        entry = WatchlistEntry(plate_pattern=pattern, reason=body.reason, added_by_id=user.id)
+        s.add(entry)
+        s.flush()
+        wl.add_entry(pattern, body.reason or "")
+        return WatchlistOut(id=entry.id, plate_pattern=entry.plate_pattern, reason=entry.reason,
+                            added_at=entry.added_at, is_active=True)
+
+
+@app.delete("/api/watchlist/{wid}", status_code=204)
+def remove_watchlist(wid: int, _: User = Depends(require_role("admin", "supervisor"))):
+    with session_scope() as s:
+        entry = s.get(WatchlistEntry, wid)
+        if not entry:
+            raise HTTPException(status_code=404, detail="not found")
+        entry.is_active = False
+        wl.remove_entry(entry.plate_pattern)
+
+
+# ----------------------------------------------------------------- ReID subjects
+
+
+@app.get("/api/reid/subjects")
+def reid_subjects(
+    limit: int = Query(default=50, le=200),
+    _: User = Depends(require_role("admin", "supervisor", "reviewer", "viewer")),
+):
+    """Live in-memory ReID subjects (vehicles tracked across cameras)."""
+    try:
+        from src.pipeline.runner import _shared_reid
+        if _shared_reid is None:
+            return []
+        return _shared_reid.store.recent_subjects(limit=limit)
+    except Exception:
+        # Fallback: query DB
+        from sqlalchemy import select
+        from src.evidence.models import ReidSubject
+        with session_scope() as s:
+            rows = s.scalars(
+                select(ReidSubject).order_by(ReidSubject.last_seen_at.desc()).limit(limit)
+            ).all()
+            return [
+                {
+                    "global_id": r.global_id,
+                    "plate_text": r.plate_text,
+                    "vehicle_color": r.vehicle_color,
+                    "vehicle_type": r.vehicle_type,
+                    "cameras": r.camera_ids,
+                    "first_seen": r.first_seen_at.isoformat() if r.first_seen_at else None,
+                    "last_seen": r.last_seen_at.isoformat() if r.last_seen_at else None,
+                    "match_count": r.match_count,
+                }
+                for r in rows
+            ]
+
+
+@app.get("/api/reid/stats")
+def reid_stats(_: User = Depends(require_role("admin", "supervisor", "reviewer", "viewer"))):
+    try:
+        from src.pipeline.runner import _shared_reid
+        if _shared_reid is None:
+            return {"enabled": False}
+        stats = _shared_reid.stats()
+        stats["enabled"] = True
+        return stats
+    except Exception:
+        return {"enabled": False, "error": "pipeline not running"}
+
+
+# ----------------------------------------------------------------- alert engine toggle
+
+
+@app.post("/api/alert-engine/toggle")
+def toggle_alert_engine(
+    enabled: bool = Query(...),
+    _: User = Depends(require_role("admin")),
+):
+    from src.rules.alert_engine import AlertEngine
+    log.info("alert_engine_toggle", enabled=enabled)
+    return {"enabled": enabled, "note": "takes effect on next pipeline cycle"}
+
+
+# ----------------------------------------------------------------- device info
+
+
+@app.get("/api/device")
+def device_info():
+    info: dict = {"device": settings.device}
+    try:
+        import torch
+        info["cuda_available"] = torch.cuda.is_available()
+        if torch.cuda.is_available():
+            info["gpu_name"] = torch.cuda.get_device_name(0)
+            props = torch.cuda.get_device_properties(0)
+            info["vram_gb"] = round(props.total_memory / 1e9, 1)
+    except ImportError:
+        info["cuda_available"] = False
+    return info
+
+
+# ----------------------------------------------------------------- WebSocket
+
+
+@app.websocket("/ws/events")
+async def ws_events(websocket: WebSocket):
+    await websocket.accept()
+    q: asyncio.Queue = asyncio.Queue(maxsize=64)
+    async with _ws_lock:
+        _ws_clients.append(q)
+    try:
+        while True:
+            try:
+                payload = await asyncio.wait_for(q.get(), timeout=30.0)
+                await websocket.send_json(payload)
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "ping"})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        async with _ws_lock:
+            if q in _ws_clients:
+                _ws_clients.remove(q)
 
 
 # ----------------------------------------------------------------- health
@@ -286,9 +548,26 @@ def index():
 def on_startup():
     from src.common.db import engine
     Base.metadata.create_all(bind=engine())
+    _bootstrap_admin()
+    wl.load_from_csv(Path("data/watchlist_seed.csv"))
+    wl.load_from_db()
     log.info("db_tables_created")
     if settings.prometheus_port:
         try:
             start_metrics_server(settings.prometheus_port)
         except OSError:
             log.warning("prometheus_port_in_use", port=settings.prometheus_port)
+
+
+def _bootstrap_admin() -> None:
+    email = settings.bootstrap_admin_email
+    with session_scope() as s:
+        if not s.scalar(select(User).where(User.email == email)):
+            s.add(User(
+                email=email,
+                full_name="System Admin",
+                password_hash=hash_password(settings.bootstrap_admin_password.get_secret_value()),
+                role="admin",
+                is_active=True,
+            ))
+            log.info("admin_bootstrapped", email=email)

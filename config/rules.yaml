@@ -1,6 +1,16 @@
 # Tunable parameters for the violation rules engine.
 # Keep all magic numbers here so police/ops can adjust without code changes.
 
+# ---- Global alert engine ---------------------------------------------------
+alert_engine:
+  enabled: true                    # master kill-switch; false = no alerts fire
+  # Per-priority cooldowns (seconds): same plate + same rule within this window = suppressed
+  cooldown_HIGH: 30
+  cooldown_MEDIUM: 60
+  cooldown_LOW: 120
+
+# ---- Individual rules -------------------------------------------------------
+
 helmet:
   enabled: true
   # A "rider" track must be observed without a helmet for at least this many
@@ -32,3 +42,39 @@ plate_unreadable:
   # Skip very small/distant detections — they're naturally unreadable and
   # would produce useless evidence.
   min_plate_pixel_area: 800
+
+wrong_way:
+  enabled: true
+  # Minimum frames vehicle must be moving against lawful direction before firing.
+  min_frames_wrong_way: 10
+  # Dot product with the anti-direction must exceed this (ensures movement, not noise).
+  min_speed_px_per_frame: 2.0
+  # Cooldown per track (seconds).
+  per_track_cooldown_seconds: 45
+
+triple_riding:
+  enabled: true
+  # Number of riders (persons) overlapping the two-wheeler to trigger.
+  min_rider_count: 3
+  # Minimum frames the triple-riding must be sustained.
+  min_consecutive_frames: 6
+  # IOU threshold for person-on-bike overlap (fraction of person box contained in bike box).
+  person_bike_overlap: 0.30
+  per_track_cooldown_seconds: 60
+
+overspeed:
+  enabled: false       # needs per-camera meters_per_pixel calibration first
+  # Speed threshold in km/h. Indian urban road default.
+  threshold_kmh: 60
+  # Minimum frames to accumulate velocity estimate.
+  min_frames_for_estimate: 5
+  # Per-camera calibration: meters per pixel (set via calibrate.py --speed).
+  # Leave 0.0 to disable per camera if not calibrated.
+  default_meters_per_pixel: 0.05
+  per_track_cooldown_seconds: 30
+
+watchlist:
+  enabled: true
+  # Watchlist hits bypass all other cooldowns; always fire.
+  # Match modes: "exact" or "prefix" (matches state code prefix e.g. "TS09")
+  match_mode: "prefix"

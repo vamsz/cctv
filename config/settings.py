@@ -47,8 +47,8 @@ class Settings(BaseSettings):
     plate_weights: Path = Field(default=ROOT / "models" / "plate.pt")
     ocr_lang: str = "en"
 
-    # inference
-    device: str = "cuda:0"
+    # inference — auto-detects CUDA if not set in env
+    device: str = ""
     max_fps: int = 15
     det_conf: float = 0.35
     ocr_auto_accept: float = 0.80
@@ -83,6 +83,15 @@ class Settings(BaseSettings):
     # retention
     evidence_retention_days: int = 180
     archive_s3_bucket: str = ""
+
+    # reid
+    reid_enabled: bool = True
+    reid_threshold: float = 0.85         # cosine similarity threshold for cross-camera match
+    reid_max_age_seconds: float = 300.0  # how long to keep embeddings in memory
+    reid_extract_every_n: int = 15       # extract embedding every N frames per track
+
+    # plate detection
+    sahi_plate_enabled: bool = False     # sliced plate inference (adds ~10ms per frame)
 
     # chalana
     chalana_api_url: str = ""
@@ -132,7 +141,21 @@ class Settings(BaseSettings):
             raise RuntimeError("Production preflight failed:\n  - " + "\n  - ".join(problems))
 
 
+def _auto_device(requested: str) -> str:
+    if requested:
+        return requested
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda:0"
+    except ImportError:
+        pass
+    return "cpu"
+
+
 settings = Settings()
+settings.device = _auto_device(settings.device)
+
 # Best-effort path setup for local/dev; production paths are owned by the OS package.
 for p in (settings.evidence_dir, settings.evidence_signing_key_path.parent):
     try:

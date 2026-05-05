@@ -4,6 +4,9 @@ opencv-python-headless==4.10.0.84
 numpy==1.26.4
 easyocr==1.7.2
 
+# ReID — optional but recommended; falls back to numpy cosine search
+faiss-cpu
+
 # API + DB
 fastapi==0.115.5
 uvicorn[standard]==0.32.1

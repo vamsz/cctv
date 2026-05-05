@@ -66,9 +66,11 @@ class Detector:
         plate_weights: Optional[Path] = None,
         device: str = "cuda:0",
         conf: float = 0.35,
+        use_sahi_plate: bool = False,
     ):
         self.device = device
         self.conf = conf
+        self.use_sahi_plate = use_sahi_plate
         self.general = YOLO(str(general_weights))
 
         self.helmet = None
@@ -78,6 +80,9 @@ class Detector:
         self.plate = None
         if plate_weights and Path(plate_weights).exists():
             self.plate = YOLO(str(plate_weights))
+
+        if self.use_sahi_plate and self.plate is None:
+            self.use_sahi_plate = False
 
     def __call__(self, frame: np.ndarray, frame_idx: int, timestamp: float) -> DetectionBundle:
         bundle = DetectionBundle(frame_idx=frame_idx, timestamp=timestamp)
@@ -114,13 +119,26 @@ class Detector:
 
         # --- plate head ---
         if self.plate is not None:
-            res = self.plate.predict(frame, device=self.device, conf=self.conf, verbose=False)[0]
-            if res.boxes is not None and len(res.boxes) > 0:
-                xyxy = res.boxes.xyxy.cpu().numpy()
-                confs = res.boxes.conf.cpu().numpy()
-                for box, c in zip(xyxy, confs):
+            if self.use_sahi_plate:
+                from .plate_sahi import detect_plates_sliced
+                for xyxy_box, c in detect_plates_sliced(
+                    frame, self.plate, self.device, self.conf
+                ):
                     bundle.detections.append(
-                        Detection(cls=ObjectClass.LICENSE_PLATE, conf=float(c), xyxy=tuple(map(float, box)))
+                        Detection(cls=ObjectClass.LICENSE_PLATE, conf=c, xyxy=xyxy_box)
                     )
+            else:
+                res = self.plate.predict(frame, device=self.device, conf=self.conf, verbose=False)[0]
+                if res.boxes is not None and len(res.boxes) > 0:
+                    xyxy = res.boxes.xyxy.cpu().numpy()
+                    confs = res.boxes.conf.cpu().numpy()
+                    for box, c in zip(xyxy, confs):
+                        bundle.detections.append(
+                            Detection(
+                                cls=ObjectClass.LICENSE_PLATE,
+                                conf=float(c),
+                                xyxy=tuple(map(float, box)),
+                            )
+                        )
 
         return bundle

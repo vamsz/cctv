@@ -118,3 +118,34 @@ class CameraHealth(Base):
     is_up = Column(Boolean, nullable=False, default=False)
     last_error = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
+class WatchlistEntry(Base):
+    __tablename__ = "watchlist"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plate_pattern = Column(String(32), unique=True, index=True, nullable=False)
+    reason = Column(String(512), nullable=True)
+    added_by_id = Column(Integer, nullable=True)
+    added_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+
+
+class ReidSubject(Base):
+    """Persistent cross-camera identity — one row per unique vehicle seen across cameras."""
+    __tablename__ = "reid_subjects"
+
+    global_id = Column(String(36), primary_key=True)   # UUID
+    first_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    last_seen_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    camera_ids = Column(JSON, nullable=False, default=list)    # list[str]
+    plate_text = Column(String(32), nullable=True, index=True)
+    vehicle_color = Column(String(32), nullable=True)
+    vehicle_type = Column(String(32), nullable=True)
+    match_count = Column(Integer, nullable=False, default=1)   # total cross-camera matches
+    is_watchlisted = Column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_reid_subjects_plate", "plate_text"),
+        Index("ix_reid_subjects_last_seen", "last_seen_at"),
+    )
