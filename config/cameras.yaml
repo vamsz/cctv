@@ -2,113 +2,40 @@
 #
 # `source` accepts anything OpenCV's VideoCapture accepts:
 #   - rtsp://user:pass@host:554/Streaming/Channels/101  (most CCTV NVRs)
-#   - /path/to/file.mp4  (offline test)
+#   - http://host/mjpeg  (some IP cameras)
+#   - /path/to/file.mp4  (good for offline test drives)
 #   - 0  (local webcam, integer)
 #
-# `stop_line`       polyline in pixel coordinates — red-light rule uses this.
-# `signal_roi`      [x1,y1,x2,y2] crop of the traffic-light face.
-# `direction`       unit vector [dx,dy] of lawful travel direction (image space).
-# `meters_per_pixel` calibration factor for speed estimation.
-# `loitering_zones` list of zones for dwell-time loitering detection.
-# `crowd_zones`     list of zones for density-based crowd analysis.
-# `homography_pts`  4 matching image↔world pairs for ground-plane calibration.
+# `stop_line` is a polyline in pixel coordinates of the source frame.
+# Points are [x, y] pairs. Used by the red-light rule.
 #
-# Loitering / crowd zone polygon: pixel [x,y] corners, clockwise.
-# After pointing at a real camera run:
-#   python scripts/calibrate.py --camera CAM01
+# `signal_roi` is a bounding box [x1, y1, x2, y2] cropping the traffic
+# light face. The signal-state classifier reads only this region.
+#
+# `direction` is the lawful travel direction across the stop line, as a
+# unit vector [dx, dy] in image space. The red-light rule fires only when
+# a tracked vehicle crosses the line moving in this direction during red.
+#
+# Coordinates depend on the specific camera mount, so the values below are
+# placeholders. After you point the system at a real camera, run
+# `python scripts/calibrate.py --camera CAM01` to draw the polygons on a
+# still frame and dump the YAML.
 
 cameras:
   - id: CAM01
-    name: "Signal Free Road - Junction A"
-    source: "data/samples/test1.mp4"
+    name: Test Feed
+    source: data/samples/test1.mp4
     fps_cap: 15
-    stop_line: [[100, 500], [1180, 500]]
-    signal_roi: [1080, 50, 1180, 200]
-    direction: [0.0, -1.0]
-    meters_per_pixel: 0.05
+    stop_line: [[100, 600], [1820, 600]]      # placeholder
+    signal_roi: [1500, 80, 1620, 280]          # placeholder
+    direction: [0.0, -1.0]                      # placeholder: vehicles travel "up" the frame
     enabled: true
 
-    loitering_zones:
-      - id: "lz_footpath_a"
-        label: "Footpath A"
-        polygon: [[0,300],[640,300],[640,720],[0,720]]
-        threshold_seconds: 30
-      - id: "lz_junction_corner"
-        label: "Junction Corner"
-        polygon: [[640,300],[1280,300],[1280,720],[640,720]]
-        threshold_seconds: 25
-
-    crowd_zones:
-      - id: "cz_junction"
-        label: "Junction"
-        polygon: [[0,200],[1280,200],[1280,720],[0,720]]
-
-  - id: CAM02
-    name: "NH48 Highway Entry"
-    source: "data/samples/test2.mp4"
-    fps_cap: 25
-    stop_line: [[100, 500], [1180, 500]]
-    signal_roi: [1080, 50, 1180, 200]
-    direction: [0.0, -1.0]
-    meters_per_pixel: 0.04
-    enabled: true
-
-    loitering_zones:
-      - id: "lz_highway_shoulder"
-        label: "Highway Shoulder"
-        polygon: [[0,400],[400,400],[400,720],[0,720]]
-        threshold_seconds: 20
-      - id: "lz_entry_gate"
-        label: "Entry Gate"
-        polygon: [[880,300],[1280,300],[1280,720],[880,720]]
-        threshold_seconds: 20
-
-    crowd_zones:
-      - id: "cz_highway_entry"
-        label: "Entry Zone"
-        polygon: [[0,200],[1280,200],[1280,720],[0,720]]
-
-  - id: CAM03
-    name: "Market Circle"
-    source: "data/samples/test3.mp4"
+  - id: SAMPLE
+    name: "Local sample video for offline test"
+    source: "./data/samples/traffic.mp4"
     fps_cap: 15
     stop_line: [[100, 500], [1180, 500]]
     signal_roi: [1080, 50, 1180, 200]
     direction: [0.0, -1.0]
-    meters_per_pixel: 0.06
-    enabled: true
-
-    loitering_zones:
-      - id: "lz_market_front"
-        label: "Market Front"
-        polygon: [[0,250],[640,250],[640,720],[0,720]]
-        threshold_seconds: 45
-      - id: "lz_market_rear"
-        label: "Market Rear"
-        polygon: [[640,250],[1280,250],[1280,720],[640,720]]
-        threshold_seconds: 45
-
-    crowd_zones:
-      - id: "cz_market_circle"
-        label: "Market Circle"
-        polygon: [[0,150],[1280,150],[1280,720],[0,720]]
-
-  - id: CAM04
-    name: "Extra feed A"
-    source: "data/samples/test4.mp4"
-    fps_cap: 15
-    stop_line: [[100, 500], [1180, 500]]
-    signal_roi: [1080, 50, 1180, 200]
-    direction: [0.0, -1.0]
-    meters_per_pixel: 0.05
-    enabled: false
-
-  - id: CAM05
-    name: "Extra feed B"
-    source: "data/samples/test5.mp4"
-    fps_cap: 15
-    stop_line: [[100, 500], [1180, 500]]
-    signal_roi: [1080, 50, 1180, 200]
-    direction: [0.0, -1.0]
-    meters_per_pixel: 0.05
     enabled: false
