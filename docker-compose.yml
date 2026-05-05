@@ -1,10 +1,35 @@
+version: "3.9"
+
+# PRAHARI — Multi-container deployment
+# Services: pipeline (GPU inference) + api (dashboard) + prometheus + grafana
+#
+# Quick start:
+#   cp .env.example .env          # fill in secrets
+#   docker compose up --build
+#   open http://localhost:8000    # dashboard
+#   open http://localhost:3000    # grafana (admin/admin on first run)
+
+networks:
+  prahari:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
+
 services:
+  # ──────────────────────────────────────────────────────────────
+  # PIPELINE — GPU inference (YOLO + OCR + analytics)
+  # ──────────────────────────────────────────────────────────────
   pipeline:
     build: .
-    image: cctv-enforcement:latest
-    container_name: cctv-pipeline
+    image: prahari:latest
+    container_name: prahari-pipeline
     restart: unless-stopped
     env_file: .env
+    environment:
+      - PROMETHEUS_PORT=9090
+    networks: [prahari]
     volumes:
       - ./config:/app/config
       - ./models:/app/models
@@ -17,17 +42,68 @@ services:
               count: all
               capabilities: [gpu]
     command: ["python", "scripts/run_pipeline.py"]
+    # No healthcheck — pipeline is headless; API healthcheck covers system health
 
+  # ──────────────────────────────────────────────────────────────
+  # API — Dashboard + REST + WebSocket
+  # ──────────────────────────────────────────────────────────────
   api:
-    image: cctv-enforcement:latest
-    container_name: cctv-api
+    image: prahari:latest
+    container_name: prahari-api
     restart: unless-stopped
+    env_file: .env
+    environment:
+      - PROMETHEUS_PORT=9091   # API exposes its own metrics on 9091
     depends_on:
       - pipeline
-    env_file: .env
+    networks: [prahari]
     ports:
       - "8000:8000"
     volumes:
       - ./config:/app/config
       - ./data:/app/data
     command: ["python", "scripts/run_api.py"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  # ──────────────────────────────────────────────────────────────
+  # PROMETHEUS — Metrics collection
+  # ──────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: prahari-prometheus
+    restart: unless-stopped
+    networks: [prahari]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+
+  # ──────────────────────────────────────────────────────────────
+  # GRAFANA — Dashboards
+  # ──────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.3
+    container_name: prahari-grafana
+    restart: unless-stopped
+    networks: [prahari]
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_PATHS_PROVISIONING=/etc/grafana/provisioning

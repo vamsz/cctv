@@ -149,3 +149,48 @@ class ReidSubject(Base):
         Index("ix_reid_subjects_plate", "plate_text"),
         Index("ix_reid_subjects_last_seen", "last_seen_at"),
     )
+
+
+class Incident(Base):
+    """Safety incident — violence, loitering, stampede, abandoned object."""
+    __tablename__ = "incidents"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    camera_id = Column(String(64), index=True, nullable=False)
+    # violence | loitering | abandoned | stampede
+    itype = Column(String(32), index=True, nullable=False)
+    started_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    resolved_at = Column(DateTime, nullable=True)
+    # suspected → active → resolved
+    status = Column(String(16), nullable=False, default="suspected", index=True)
+    score = Column(Float, nullable=False, default=0.0)
+    flags = Column(JSON, nullable=True)
+    track_id = Column(Integer, nullable=True)
+    zone_id = Column(String(64), nullable=True)
+    extras = Column(JSON, nullable=True)
+    is_false_positive = Column(Boolean, nullable=False, default=False)
+    resolved_by_id = Column(Integer, nullable=True)
+
+    __table_args__ = (
+        Index("ix_incidents_camera_status", "camera_id", "status"),
+        Index("ix_incidents_type_started", "itype", "started_at"),
+    )
+
+
+class CrowdSnapshot(Base):
+    """Point-in-time crowd density snapshot — written on warning/critical or every N frames."""
+    __tablename__ = "crowd_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    camera_id = Column(String(64), index=True, nullable=False)
+    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    total_count = Column(Integer, nullable=False, default=0)
+    max_density = Column(Float, nullable=False, default=0.0)
+    stampede_score = Column(Float, nullable=False, default=0.0)
+    stampede_level = Column(String(16), nullable=False, default="ok")
+    stampede_flags = Column(JSON, nullable=True)
+    zones_json = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_crowd_snapshots_camera_ts", "camera_id", "timestamp"),
+    )

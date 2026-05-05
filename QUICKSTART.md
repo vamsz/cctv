@@ -1,4 +1,4 @@
-# CCTV Enforcement — Quickstart
+# CCTV Enforcement — Quickstart (legacy — see HOW_TO_RUN.md for the full guide)
 
 ## What's working right now
 

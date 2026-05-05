@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     detector_weights: Path = Field(default=ROOT / "models" / "yolo11n.pt")
     helmet_weights: Path = Field(default=ROOT / "models" / "helmet.pt")
     plate_weights: Path = Field(default=ROOT / "models" / "plate.pt")
+    pose_weights: str = "yolo11n-pose.pt"   # auto-downloads ~6MB; relative = ultralytics cache
     ocr_lang: str = "en"
 
     # inference — auto-detects CUDA if not set in env

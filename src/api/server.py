@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import io
 import time
+import yaml
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -51,7 +52,7 @@ from src.common.logging import configure_logging, get_logger
 from src.common.metrics import review_action_total, review_backlog, start_metrics_server
 from src.common.object_store import get_object_store
 from src.common.security import hash_password, issue_jwt, verify_password, JWTError, verify_jwt
-from src.evidence.models import Base, CameraHealth, User, Violation, WatchlistEntry
+from src.evidence.models import Base, CameraHealth, Incident, User, Violation, WatchlistEntry
 from src.evidence.store import ReviewStatus
 from src.rules import watchlist as wl
 
@@ -428,33 +429,34 @@ def reid_subjects(
     limit: int = Query(default=50, le=200),
     _: User = Depends(require_role("admin", "supervisor", "reviewer", "viewer")),
 ):
-    """Live in-memory ReID subjects (vehicles tracked across cameras)."""
+    """Live in-memory ReID subjects; falls back to DB when pipeline isn't running."""
     try:
         from src.pipeline.runner import _shared_reid
-        if _shared_reid is None:
-            return []
-        return _shared_reid.store.recent_subjects(limit=limit)
+        if _shared_reid is not None:
+            return _shared_reid.store.recent_subjects(limit=limit)
     except Exception:
-        # Fallback: query DB
-        from sqlalchemy import select
-        from src.evidence.models import ReidSubject
-        with session_scope() as s:
-            rows = s.scalars(
-                select(ReidSubject).order_by(ReidSubject.last_seen_at.desc()).limit(limit)
-            ).all()
-            return [
-                {
-                    "global_id": r.global_id,
-                    "plate_text": r.plate_text,
-                    "vehicle_color": r.vehicle_color,
-                    "vehicle_type": r.vehicle_type,
-                    "cameras": r.camera_ids,
-                    "first_seen": r.first_seen_at.isoformat() if r.first_seen_at else None,
-                    "last_seen": r.last_seen_at.isoformat() if r.last_seen_at else None,
-                    "match_count": r.match_count,
-                }
-                for r in rows
-            ]
+        pass
+
+    # DB fallback — used when pipeline is stopped or during review-only sessions
+    from sqlalchemy import select
+    from src.evidence.models import ReidSubject
+    with session_scope() as s:
+        rows = s.scalars(
+            select(ReidSubject).order_by(ReidSubject.last_seen_at.desc()).limit(limit)
+        ).all()
+        return [
+            {
+                "global_id": r.global_id,
+                "plate_text": r.plate_text,
+                "vehicle_color": r.vehicle_color,
+                "vehicle_type": r.vehicle_type,
+                "cameras": r.camera_ids,
+                "first_seen": r.first_seen_at.isoformat() if r.first_seen_at else None,
+                "last_seen": r.last_seen_at.isoformat() if r.last_seen_at else None,
+                "match_count": r.match_count,
+            }
+            for r in rows
+        ]
 
 
 @app.get("/api/reid/stats")
@@ -468,6 +470,251 @@ def reid_stats(_: User = Depends(require_role("admin", "supervisor", "reviewer",
         return stats
     except Exception:
         return {"enabled": False, "error": "pipeline not running"}
+
+
+# ----------------------------------------------------------------- incidents
+
+
+class IncidentOut(BaseModel):
+    id: int
+    camera_id: str
+    itype: str
+    started_at: datetime
+    resolved_at: Optional[datetime]
+    status: str
+    score: float
+    flags: Optional[list]
+    track_id: Optional[int]
+    zone_id: Optional[str]
+    extras: Optional[dict]
+    is_false_positive: bool
+
+
+def _incident_out(row: Incident) -> IncidentOut:
+    return IncidentOut(
+        id=row.id,
+        camera_id=row.camera_id,
+        itype=row.itype,
+        started_at=row.started_at,
+        resolved_at=row.resolved_at,
+        status=row.status,
+        score=row.score,
+        flags=row.flags,
+        track_id=row.track_id,
+        zone_id=row.zone_id,
+        extras=row.extras,
+        is_false_positive=row.is_false_positive,
+    )
+
+
+@app.get("/api/incidents", response_model=list[IncidentOut])
+def list_incidents(
+    itype: Optional[str] = None,
+    status: Optional[str] = None,
+    camera_id: Optional[str] = None,
+    limit: int = Query(default=100, le=500),
+    _: None = Depends(rate_limit),
+):
+    with session_scope() as s:
+        stmt = select(Incident).order_by(Incident.started_at.desc())
+        if itype:
+            stmt = stmt.where(Incident.itype == itype)
+        if status:
+            stmt = stmt.where(Incident.status == status)
+        if camera_id:
+            stmt = stmt.where(Incident.camera_id == camera_id)
+        stmt = stmt.where(Incident.is_false_positive == False)
+        rows = s.scalars(stmt.limit(limit)).all()
+        return [_incident_out(r) for r in rows]
+
+
+@app.post("/api/incidents/{iid}/resolve", response_model=IncidentOut)
+def resolve_incident(
+    iid: int,
+    user: User = Depends(require_role("admin", "supervisor", "reviewer")),
+):
+    with session_scope() as s:
+        row = s.get(Incident, iid)
+        if not row:
+            raise HTTPException(status_code=404, detail="not found")
+        row.status = "resolved"
+        row.resolved_at = datetime.utcnow()
+        row.resolved_by_id = user.id
+        s.flush()
+        return _incident_out(row)
+
+
+@app.post("/api/incidents/{iid}/false-positive", response_model=IncidentOut)
+def mark_false_positive(
+    iid: int,
+    _: User = Depends(require_role("admin", "supervisor", "reviewer")),
+):
+    with session_scope() as s:
+        row = s.get(Incident, iid)
+        if not row:
+            raise HTTPException(status_code=404, detail="not found")
+        row.is_false_positive = True
+        row.status = "resolved"
+        row.resolved_at = datetime.utcnow()
+        s.flush()
+        return _incident_out(row)
+
+
+# ----------------------------------------------------------------- live MJPEG feed
+
+
+@app.get("/api/cameras/{camera_id}/snapshot")
+async def camera_snapshot(camera_id: str, _: None = Depends(rate_limit)):
+    """Latest JPEG frame from the pipeline for a given camera."""
+    try:
+        from src.pipeline.runner import get_live_frame
+        data = get_live_frame(camera_id)
+    except Exception:
+        data = None
+    if not data:
+        raise HTTPException(status_code=503, detail="no frame available — pipeline may not be running")
+    return StreamingResponse(io.BytesIO(data), media_type="image/jpeg",
+                             headers={"Cache-Control": "no-cache, no-store"})
+
+
+@app.get("/api/cameras/{camera_id}/mjpeg")
+async def camera_mjpeg(camera_id: str):
+    """
+    MJPEG multipart stream for a single camera.
+    Open in <img src="/api/cameras/CAM01/mjpeg"> for a live view.
+    Pushes at ~10fps regardless of pipeline fps_cap.
+    """
+    from src.pipeline.runner import get_live_frame
+
+    async def generate():
+        boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+        while True:
+            data = get_live_frame(camera_id)
+            if data:
+                yield boundary + data + b"\r\n"
+            await asyncio.sleep(0.10)   # ~10fps
+
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache, no-store", "Connection": "keep-alive"},
+    )
+
+
+@app.get("/api/live/cameras")
+def live_cameras(_: None = Depends(rate_limit)):
+    """List camera IDs that currently have a live frame buffer."""
+    try:
+        from src.pipeline.runner import get_all_live_cameras
+        return {"cameras": get_all_live_cameras()}
+    except Exception:
+        return {"cameras": []}
+
+
+# ----------------------------------------------------------------- settings
+
+
+class RuleToggleIn(BaseModel):
+    rule: str
+    enabled: bool
+
+
+@app.get("/api/settings/rules")
+def get_settings_rules(_: User = Depends(require_role("admin", "supervisor", "reviewer", "viewer"))):
+    """Return the full rules.yaml as a JSON object (live state if pipeline running)."""
+    try:
+        from src.pipeline.runner import get_shared_rule_params
+        params = get_shared_rule_params()
+        if params is not None:
+            return params
+    except Exception:
+        pass
+    # Fallback: read from file
+    with open(settings.rules_yaml) as f:
+        return yaml.safe_load(f) or {}
+
+
+@app.post("/api/settings/rules/toggle")
+def toggle_rule(
+    body: RuleToggleIn,
+    user: User = Depends(require_role("admin", "supervisor")),
+):
+    """
+    Toggle a rule's enabled flag at runtime.
+    Takes effect immediately (pipeline reads params per-frame).
+    Also persists to rules.yaml for restart survival.
+    """
+    rule = body.rule.lower().strip()
+    ALLOWED_RULES = {"helmet", "red_light", "plate_unreadable", "wrong_way",
+                     "triple_riding", "overspeed", "watchlist",
+                     "crowd", "violence", "loitering", "abandoned"}
+    if rule not in ALLOWED_RULES:
+        raise HTTPException(status_code=400, detail=f"unknown rule: {rule}")
+
+    # Update in-memory dict (immediate effect on running pipeline)
+    try:
+        from src.pipeline.runner import get_shared_rule_params
+        params = get_shared_rule_params()
+        if params is not None and rule in params:
+            params[rule]["enabled"] = body.enabled
+    except Exception:
+        pass
+
+    # Persist to file
+    try:
+        with open(settings.rules_yaml) as f:
+            data = yaml.safe_load(f) or {}
+        if rule in data:
+            data[rule]["enabled"] = body.enabled
+        with open(settings.rules_yaml, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
+    except Exception as e:
+        log.warning("settings_persist_failed: %s", e)
+
+    log.info("rule_toggle", rule=rule, enabled=body.enabled, actor=user.email)
+    return {"rule": rule, "enabled": body.enabled}
+
+
+# ----------------------------------------------------------------- crowd state
+
+
+@app.get("/api/crowd/state")
+def crowd_state(_: None = Depends(rate_limit)):
+    """Latest crowd state per camera (live from pipeline memory)."""
+    try:
+        from src.pipeline.runner import get_crowd_state
+        return get_crowd_state()
+    except Exception:
+        return {}
+
+
+@app.get("/api/crowd/history")
+def crowd_history(
+    camera_id: Optional[str] = None,
+    limit: int = Query(default=60, le=500),
+    _: None = Depends(rate_limit),
+):
+    """Recent crowd snapshots from DB (warning/critical events + periodic)."""
+    from src.evidence.models import CrowdSnapshot
+    with session_scope() as s:
+        stmt = select(CrowdSnapshot).order_by(CrowdSnapshot.timestamp.desc())
+        if camera_id:
+            stmt = stmt.where(CrowdSnapshot.camera_id == camera_id)
+        rows = s.scalars(stmt.limit(limit)).all()
+        return [
+            {
+                "id": r.id,
+                "camera_id": r.camera_id,
+                "timestamp": r.timestamp.isoformat(),
+                "total_count": r.total_count,
+                "max_density": r.max_density,
+                "stampede_score": r.stampede_score,
+                "stampede_level": r.stampede_level,
+                "stampede_flags": r.stampede_flags,
+                "zones": r.zones_json,
+            }
+            for r in rows
+        ]
 
 
 # ----------------------------------------------------------------- alert engine toggle
@@ -547,7 +794,8 @@ def index():
 @app.on_event("startup")
 def on_startup():
     from src.common.db import engine
-    Base.metadata.create_all(bind=engine())
+    from src.evidence.models import Base as FullBase
+    FullBase.metadata.create_all(bind=engine())
     _bootstrap_admin()
     wl.load_from_csv(Path("data/watchlist_seed.csv"))
     wl.load_from_db()

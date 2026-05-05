@@ -50,7 +50,7 @@ class EvidenceStore:
         day = ts.strftime("%Y-%m-%d")
         prefix = f"{event.camera_id}/{day}/{ts.strftime('%H%M%S%f')}_{event.code.value}_t{event.track_id}"
 
-        frame_bytes = self._encode(frame, quality=92)
+        frame_bytes = self._encode(frame, quality=90)
         sha = sha256_bytes(frame_bytes)
         frame_key = f"{prefix}_frame.jpg"
         self.objects.put_bytes(frame_key, frame_bytes, "image/jpeg")
@@ -58,7 +58,8 @@ class EvidenceStore:
         annotated_key = None
         if annotated is not None:
             annotated_key = f"{prefix}_annot.jpg"
-            self.objects.put_bytes(annotated_key, self._encode(annotated, 92), "image/jpeg")
+            # Preview image: max 960px wide, quality 72 — ~30-50KB vs 250KB, loads instantly
+            self.objects.put_bytes(annotated_key, self._encode(annotated, 72, max_dim=960), "image/jpeg")
 
         plate_key = None
         if plate_crop is not None and plate_crop.size > 0:
@@ -136,7 +137,13 @@ class EvidenceStore:
     # --------------------------------------------------------------- helpers
 
     @staticmethod
-    def _encode(img: np.ndarray, quality: int) -> bytes:
+    def _encode(img: np.ndarray, quality: int, max_dim: int = 0) -> bytes:
+        """Encode to JPEG. If max_dim > 0, downscale so longest side ≤ max_dim first."""
+        if max_dim > 0:
+            h, w = img.shape[:2]
+            if max(h, w) > max_dim:
+                scale = max_dim / max(h, w)
+                img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, int(quality)])
         if not ok:
             raise RuntimeError("JPEG encode failed")

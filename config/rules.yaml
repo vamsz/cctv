@@ -1,10 +1,15 @@
 # Tunable parameters for the violation rules engine.
-# Keep all magic numbers here so police/ops can adjust without code changes.
+# All thresholds are calibrated for Indian traffic and crowd conditions:
+#   - Roads are densely mixed (two-wheelers, autos, vehicles, pedestrians)
+#   - Crowd density is routinely 3-5× higher than Western baselines
+#   - Driver behaviour includes animated gestures (not to be flagged as violence)
+#   - Markets, railway stations, temples have sustained standing/sitting crowds
+# Keep all magic numbers here — no restarts needed for rule enable/disable.
 
 # ---- Global alert engine ---------------------------------------------------
 alert_engine:
-  enabled: true                    # master kill-switch; false = no alerts fire
-  # Per-priority cooldowns (seconds): same plate + same rule within this window = suppressed
+  enabled: true
+  # Per-priority cooldowns (seconds): same plate + same rule = suppressed
   cooldown_HIGH: 30
   cooldown_MEDIUM: 60
   cooldown_LOW: 120
@@ -13,68 +18,109 @@ alert_engine:
 
 helmet:
   enabled: true
-  # A "rider" track must be observed without a helmet for at least this many
-  # consecutive frames before the rule fires. Prevents single-frame flickers.
-  min_consecutive_no_helmet_frames: 8
-  # Minimum IoU between a person box and a 2-wheeler box to call them a rider.
+  # Min consecutive frames with no-helmet before rule fires.
+  # 10 frames @ 15fps = 0.67s — enough to reject brief occlusion.
+  min_consecutive_no_helmet_frames: 10
+  # Minimum IoU between person box and 2-wheeler box to classify as a rider.
   rider_match_iou: 0.05
-  # Minimum confidence for the helmet detector head.
-  helmet_conf: 0.45
+  # Min confidence for the helmet detector (Indian helmets vary widely in shape).
+  helmet_conf: 0.40
 
 red_light:
   enabled: true
-  # The signal must be classified RED for at least this many frames before
-  # the rule starts evaluating crossings (debounce).
+  # Signal must be RED for this many frames before checking crossings.
   red_debounce_frames: 5
-  # A track is considered to have crossed the stop line if its previous
-  # frame was on the lawful side and the current frame is past it, while
-  # moving in the lawful direction.
   min_speed_px_per_frame: 1.5
-  # Cooldown so we don't fire twice for the same vehicle.
   per_track_cooldown_seconds: 30
 
 plate_unreadable:
   enabled: true
-  # Fire only when the vehicle has been tracked through the enforcement zone
-  # for at least this many frames AND no plate read ever cleared the
-  # OCR_AUTO_ACCEPT threshold.
+  # Fire only when track has been visible this long AND no OCR clear.
   min_track_frames: 25
-  # Skip very small/distant detections — they're naturally unreadable and
-  # would produce useless evidence.
+  # Ignore very small/distant plates — naturally unreadable.
   min_plate_pixel_area: 800
 
 wrong_way:
   enabled: true
-  # Minimum frames vehicle must be moving against lawful direction before firing.
+  # Min frames driving against lawful direction before firing.
   min_frames_wrong_way: 10
-  # Dot product with the anti-direction must exceed this (ensures movement, not noise).
   min_speed_px_per_frame: 2.0
-  # Cooldown per track (seconds).
   per_track_cooldown_seconds: 45
 
 triple_riding:
   enabled: true
-  # Number of riders (persons) overlapping the two-wheeler to trigger.
   min_rider_count: 3
-  # Minimum frames the triple-riding must be sustained.
   min_consecutive_frames: 6
-  # IOU threshold for person-on-bike overlap (fraction of person box contained in bike box).
   person_bike_overlap: 0.30
   per_track_cooldown_seconds: 60
 
 overspeed:
-  enabled: false       # needs per-camera meters_per_pixel calibration first
-  # Speed threshold in km/h. Indian urban road default.
+  enabled: false     # requires per-camera calibration
   threshold_kmh: 60
-  # Minimum frames to accumulate velocity estimate.
   min_frames_for_estimate: 5
-  # Per-camera calibration: meters per pixel (set via calibrate.py --speed).
-  # Leave 0.0 to disable per camera if not calibrated.
   default_meters_per_pixel: 0.05
   per_track_cooldown_seconds: 30
 
 watchlist:
   enabled: true
-  # Watchlist hits bypass all other cooldowns; always fire.
-  # Match modes: "exact" or "prefix" (matches state code prefix e.g. "TS09")
   match_mode: "prefix"
+
+# ---- Crowd analytics — India-tuned -----------------------------------------
+# Indian context: normal markets run 2-4 p/m², train stations 3-5 p/m².
+# A festival crush is 7+ p/m². Calibrate accordingly to avoid alarm fatigue.
+
+crowd:
+  enabled: true
+  # Density thresholds (people/m²)
+  warning_density: 4.0      # elevated — normal market is 2-4, alert at 4+
+  danger_density: 7.0       # Kumbh-class crush. 5 is too sensitive for India.
+  # Absolute count thresholds (used when homography is unavailable)
+  warning_count: 12
+  danger_count: 25
+  # Stampede risk score thresholds (composite 0-1)
+  stampede_warning: 0.45
+  stampede_critical: 0.70
+  # Write a DB snapshot every N frames regardless of level (~10s at 15fps)
+  snapshot_every_frames: 150
+
+  # Stampede SIGNAL trigger thresholds (India-tuned higher baselines):
+  # Indian crowds have high baseline divergence/counter-flow because
+  # people walk in all directions simultaneously (bidirectional roads, etc.)
+  stampede_divergence_min: 0.35    # was 0.25 in Western references
+  stampede_convergence_min: 0.30
+  stampede_variance_min: 3.0
+  stampede_counter_flow_min: 0.30  # was 0.20; normal Indian crowds are 0.15-0.25
+
+# ---- Violence detection — India-tuned --------------------------------------
+# Indians gesture animatedly in normal conversation. Raise thresholds to
+# avoid false positives from normal heated argument / bargaining gestures.
+
+violence:
+  enabled: true
+  run_every_n_frames: 3
+  kp_confidence: 0.40
+  # Wrist velocity: 12px/frame at 15fps = ~2m/s real-world → actual punch motion
+  wrist_velocity_threshold: 12.0   # was 8.0; reduced false +ves from gestures
+  # Proximity IoU: 0.08 — Indian crowds naturally stand closer together
+  proximity_iou: 0.08              # was 0.12; dense crowds make 0.12 too noisy
+  incident_cooldown_seconds: 60
+
+# ---- Loitering detection — India-tuned ------------------------------------
+# Street vendors, tea stalls, autorickshaw drivers routinely sit for hours.
+# A meaningful loitering flag needs a much longer window than Western standards.
+
+loitering:
+  enabled: true
+  # Default threshold if not set per zone
+  default_threshold_seconds: 120   # 2 min. Western default was 30s — too aggressive.
+  min_track_frames: 15
+  cooldown_seconds: 120
+
+# ---- Abandoned object detection -------------------------------------------
+
+abandoned:
+  enabled: true
+  # ~20 seconds at 15fps before flagging as abandoned
+  min_frames: 300                  # was 150; Indian street clutter is high
+  min_area_px2: 3000               # slightly larger to ignore small debris
+  person_iou_threshold: 0.15

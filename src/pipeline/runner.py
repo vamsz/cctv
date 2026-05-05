@@ -5,6 +5,10 @@ For each enabled camera we spin up:
   - one inference thread that pulls the latest frame and runs:
       detect -> track -> attach plates by IoU -> OCR plates of unread
       tracks -> signal classify -> rules engine -> persist evidence
+      → crowd density + optical flow + stampede risk
+      → pose Stage-1 violence heuristics + incident lifecycle
+      → loitering zone dwell tracking
+      → abandoned object MOG2 detection
 
 The detector/OCR are shared across cameras (they're stateless), so a
 single GPU runs N cameras; only the per-camera ingest, tracker, rules,
@@ -15,7 +19,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -25,10 +30,15 @@ import yaml
 
 from config.settings import settings
 from src.attributes.classifier import VehicleAttributeClassifier
+from src.crowd.calibration import CameraCalibration
+from src.crowd.density import ZoneDensityEstimator
+from src.crowd.flow import FlowAnalyzer
+from src.crowd.stampede import StampedeDetector
 from src.detection.classes import ObjectClass, VEHICLE_CLASSES
 from src.detection.detector import Detection, Detector
 from src.evidence.store import EvidenceStore
 from src.ingest.stream import StreamConfig, StreamReader
+from src.loitering.detector import AbandonedObjectDetector, LoiteringDetector
 from src.ocr.plate_normalize import normalize_indian_plate
 from src.ocr.plate_ocr import PlateOCR
 from src.reid.matcher import CrossCameraReID
@@ -39,12 +49,57 @@ from src.rules.types import ViolationCode, ViolationEvent
 from src.rules import watchlist as wl
 from src.signal.classifier import SignalClassifier, SignalState
 from src.tracking.tracker import Tracker, TrackedDetection
+from src.violence.incident import IncidentManager
+from src.violence.pose_stage1 import PoseViolenceDetector
 from .annotate import annotate
 
 log = logging.getLogger("pipeline")
 
 # Shared ReID instance — set by PipelineOrchestrator, read by the API.
 _shared_reid: Optional["CrossCameraReID"] = None
+
+# Shared crowd state: camera_id → latest state dict (read by API, written by pipeline).
+_crowd_state: dict[str, dict] = {}
+_crowd_lock = threading.Lock()
+
+# Shared live MJPEG frame bytes: camera_id → latest JPEG bytes (read by API).
+_live_frames: dict[str, Optional[bytes]] = {}
+_live_frame_lock = threading.Lock()
+
+# Shared mutable rule params — updated by Settings API, read by all pipelines.
+_shared_rule_params: Optional[dict] = None
+_rule_params_lock = threading.Lock()
+
+
+def update_crowd_state(camera_id: str, state: dict) -> None:
+    with _crowd_lock:
+        _crowd_state[camera_id] = state
+
+
+def get_crowd_state() -> dict[str, dict]:
+    with _crowd_lock:
+        return dict(_crowd_state)
+
+
+def update_live_frame(camera_id: str, frame: np.ndarray, quality: int = 72) -> None:
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    with _live_frame_lock:
+        _live_frames[camera_id] = bytes(buf)
+
+
+def get_live_frame(camera_id: str) -> Optional[bytes]:
+    with _live_frame_lock:
+        return _live_frames.get(camera_id)
+
+
+def get_all_live_cameras() -> list[str]:
+    with _live_frame_lock:
+        return list(_live_frames.keys())
+
+
+def get_shared_rule_params() -> Optional[dict]:
+    with _rule_params_lock:
+        return _shared_rule_params
 
 
 @dataclass
@@ -56,8 +111,11 @@ class CameraSpec:
     stop_line: tuple[tuple[int, int], tuple[int, int]]
     signal_roi: Optional[tuple[int, int, int, int]]
     direction: tuple[float, float]
-    meters_per_pixel: float = 0.05    # calibrated; used for speed estimation
+    meters_per_pixel: float = 0.05
     enabled: bool = True
+    loitering_zones: list[dict] = field(default_factory=list)
+    crowd_zones: list[dict] = field(default_factory=list)
+    homography_pts: Optional[dict] = None
 
 
 def load_cameras(path: Path) -> list[CameraSpec]:
@@ -68,6 +126,7 @@ def load_cameras(path: Path) -> list[CameraSpec]:
         if not entry.get("enabled", True):
             continue
         sl = entry["stop_line"]
+        hpts = entry.get("homography_pts")
         out.append(
             CameraSpec(
                 id=entry["id"],
@@ -79,6 +138,9 @@ def load_cameras(path: Path) -> list[CameraSpec]:
                 direction=tuple(entry.get("direction", [0.0, -1.0])),
                 meters_per_pixel=float(entry.get("meters_per_pixel", 0.05)),
                 enabled=True,
+                loitering_zones=entry.get("loitering_zones", []),
+                crowd_zones=entry.get("crowd_zones", []),
+                homography_pts=hpts,
             )
         )
     return out
@@ -111,25 +173,87 @@ class CameraPipeline:
         self.reader = StreamReader(StreamConfig(camera_id=spec.id, source=spec.source, fps_cap=spec.fps_cap))
         self.tracker = Tracker(frame_rate=spec.fps_cap)
         self.signal_clf = SignalClassifier(spec.signal_roi)
-        meters_per_pixel = spec.meters_per_pixel if hasattr(spec, "meters_per_pixel") else 0.05
         self.rules = RulesEngine(
             camera_id=spec.id,
             geometry=CameraGeometry(
                 stop_line_p1=spec.stop_line[0],
                 stop_line_p2=spec.stop_line[1],
                 direction=spec.direction,
-                meters_per_pixel=meters_per_pixel,
+                meters_per_pixel=spec.meters_per_pixel,
             ),
             rule_params=rule_params,
             fps=float(spec.fps_cap),
         )
         self.alert_engine = AlertEngine(rule_params)
 
+        # ── Crowd analytics ──────────────────────────────────────────────
+        crowd_cfg = rule_params.get("crowd", {})
+        if spec.homography_pts:
+            calib = CameraCalibration.from_points(
+                spec.homography_pts["image"],
+                spec.homography_pts["world"],
+            )
+        else:
+            calib = CameraCalibration.identity()
+
+        self.density_est = ZoneDensityEstimator(
+            camera_id=spec.id,
+            zones_cfg=spec.crowd_zones,
+            calibration=calib,
+            danger_density=float(crowd_cfg.get("danger_density", 5.0)),
+            warning_density=float(crowd_cfg.get("warning_density", 3.0)),
+            danger_count=int(crowd_cfg.get("danger_count", 15)),
+            warning_count=int(crowd_cfg.get("warning_count", 8)),
+        )
+        self.flow_analyzer = FlowAnalyzer(history_len=8)
+        self.stampede_det = StampedeDetector(
+            danger_density=float(crowd_cfg.get("danger_density", 7.0)),
+            warning_threshold=float(crowd_cfg.get("stampede_warning", 0.45)),
+            critical_threshold=float(crowd_cfg.get("stampede_critical", 0.70)),
+            divergence_min=float(crowd_cfg.get("stampede_divergence_min", 0.35)),
+            convergence_min=float(crowd_cfg.get("stampede_convergence_min", 0.30)),
+            variance_min=float(crowd_cfg.get("stampede_variance_min", 3.0)),
+            counter_flow_min=float(crowd_cfg.get("stampede_counter_flow_min", 0.30)),
+        )
+        self._snapshot_interval = int(crowd_cfg.get("snapshot_every_frames", 150))
+        self._last_snapshot_frame = 0
+
+        # ── Violence detection ───────────────────────────────────────────
+        violence_cfg = rule_params.get("violence", {})
+        self._violence_enabled = bool(violence_cfg.get("enabled", True))
+        self.pose_det = PoseViolenceDetector(
+            run_every_n=int(violence_cfg.get("run_every_n_frames", 3)),
+            kp_conf=float(violence_cfg.get("kp_confidence", 0.40)),
+            proximity_iou=float(violence_cfg.get("proximity_iou", 0.12)),
+            wrist_vel_thresh=float(violence_cfg.get("wrist_velocity_threshold", 8.0)),
+            device=settings.device,
+            weights=settings.pose_weights,
+        )
+        self.incident_mgr = IncidentManager(spec.id)
+
+        # ── Loitering ────────────────────────────────────────────────────
+        loiter_cfg = rule_params.get("loitering", {})
+        self._loitering_enabled = bool(loiter_cfg.get("enabled", True))
+        self.loiter_det = LoiteringDetector(
+            camera_id=spec.id,
+            zones=spec.loitering_zones,
+            fps=float(spec.fps_cap),
+            refine_interval_s=float(loiter_cfg.get("cooldown_seconds", 60)),
+        )
+
+        # ── Abandoned objects ─────────────────────────────────────────────
+        aband_cfg = rule_params.get("abandoned", {})
+        self._abandoned_enabled = bool(aband_cfg.get("enabled", True))
+        self.abandon_det = AbandonedObjectDetector(
+            min_frames=int(aband_cfg.get("min_frames", 150)),
+            min_area_px2=int(aband_cfg.get("min_area_px2", 2500)),
+            person_iou_thresh=float(aband_cfg.get("person_iou_threshold", 0.15)),
+        )
+
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._track_first_seen_frame: dict[int, int] = {}
         self._track_last_seen_frame: dict[int, int] = {}
-        # cache: track_id -> (global_id, color, type)
         self._track_attrs: dict[int, tuple] = {}
 
     def start(self) -> None:
@@ -147,6 +271,8 @@ class CameraPipeline:
 
     def _loop(self) -> None:
         last_frame_idx = -1
+        _live_frame_counter = 0
+        from src.common.metrics import frames_total, frame_drops_total
         while not self._stop.is_set():
             packet = self.reader.read()
             if packet is None:
@@ -156,7 +282,22 @@ class CameraPipeline:
             if frame_idx == last_frame_idx:
                 time.sleep(0.005)
                 continue
+
+            # Frame-skip governor: if we're more than 3 frames behind, skip
+            # inference to catch up but still update the live frame buffer.
+            skip_count = frame_idx - last_frame_idx - 1
+            if skip_count > 0:
+                frame_drops_total.labels(camera_id=self.spec.id).inc(skip_count)
+                if skip_count > 3:
+                    log.warning("[%s] dropped %d frames (inference slower than capture)", self.spec.id, skip_count)
+
             last_frame_idx = frame_idx
+            frames_total.labels(camera_id=self.spec.id).inc()
+
+            # Update MJPEG buffer every 3 frames (~5fps at 15fps cap) — fast, low cost
+            _live_frame_counter += 1
+            if _live_frame_counter % 3 == 0:
+                update_live_frame(self.spec.id, frame)
 
             try:
                 self._process_frame(frame_idx, ts, frame)
@@ -169,20 +310,26 @@ class CameraPipeline:
 
         # Attach plates → tracks by IoU, run OCR, propagate to rules engine.
         plate_dets = bundle.of(ObjectClass.LICENSE_PLATE)
+        person_bboxes: list[tuple] = []
+
         for td in tracked:
-            if td.detection.cls not in VEHICLE_CLASSES:
+            cls = td.detection.cls
+            if cls == ObjectClass.PERSON:
+                xyxy = td.detection.xyxy
+                person_bboxes.append((xyxy[0], xyxy[1], xyxy[2], xyxy[3]))
+
+            if cls not in VEHICLE_CLASSES:
                 continue
             self._track_first_seen_frame.setdefault(td.track_id, frame_idx)
             self._track_last_seen_frame[td.track_id] = frame_idx
 
-            # --- ReID + attributes (every N frames per track) ---
+            # --- ReID + attributes ---
             if self.reid is not None:
                 plate_text_for_reid, _ = self.rules.best_plate(td.track_id)
                 attrs = self._track_attrs.get(td.track_id)
                 color = attrs[1] if attrs else None
                 vtype = attrs[2] if attrs else None
 
-                # Run attribute classifier if we don't have it yet
                 if not color and self.attr_clf:
                     crop = _crop(frame, td.detection.xyxy)
                     result = self.attr_clf.classify(crop, td.detection.cls)
@@ -200,7 +347,6 @@ class CameraPipeline:
                     vehicle_type=vtype,
                 )
 
-                # If a cross-camera match propagated a plate we didn't have, attach it
                 if propagated_plate and not plate_text_for_reid:
                     self.rules.attach_plate_read(td.track_id, propagated_plate, 0.60)
 
@@ -222,11 +368,8 @@ class CameraPipeline:
 
         signal_state = self.signal_clf.classify(frame)
         raw_events = self.rules.step(tracked, bundle, signal_state)
-
-        # Plate-unreadable for tracks that left the frame this step.
         raw_events += self._check_plate_unreadable(tracked, bundle, frame_idx, ts)
 
-        # Attach ReID global_id + attributes to each event's extras
         for ev in raw_events:
             attrs = self._track_attrs.get(ev.track_id)
             if attrs:
@@ -238,7 +381,6 @@ class CameraPipeline:
                 if vtype:
                     ev.extras["vehicle_type"] = vtype
 
-        # Global kill-switch + priority-based cooldowns.
         events = self.alert_engine.filter(raw_events)
 
         if events:
@@ -266,7 +408,283 @@ class CameraPipeline:
                 except Exception:
                     pass
 
-    # ----------------------------------------------------- helpers
+        # ── Step 3: Crowd analytics ──────────────────────────────────────
+        self._run_crowd_analytics(frame, frame_idx, person_bboxes)
+
+        # ── Step 3: Violence detection ───────────────────────────────────
+        if self._violence_enabled:
+            self._run_violence_detection(frame, frame_idx, person_bboxes)
+
+        # ── Step 3: Loitering detection ──────────────────────────────────
+        if self._loitering_enabled and person_bboxes:
+            self._run_loitering(tracked, frame_idx)
+
+        # ── Step 3: Abandoned object detection ───────────────────────────
+        if self._abandoned_enabled:
+            self._run_abandoned(frame, frame_idx, person_bboxes)
+
+    # ----------------------------------------------------- Step 3 helpers
+
+    def _run_crowd_analytics(
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        person_bboxes: list[tuple],
+    ) -> None:
+        crowd = self.density_est.update(person_bboxes)
+        flow = self.flow_analyzer.update(frame)
+        flow_smooth = self.flow_analyzer.smoothed()
+        stampede = self.stampede_det.assess(crowd, flow_smooth)
+
+        state = {
+            "camera_id": self.spec.id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "total_count": crowd.total_count,
+            "max_density": crowd.max_density,
+            "risk_level": crowd.risk_level,
+            "stampede_score": stampede.score,
+            "stampede_level": stampede.level,
+            "stampede_flags": stampede.flags,
+            "flow": {
+                "magnitude": round(flow.magnitude, 2),
+                "variance": round(flow.variance, 2),
+                "divergence": round(flow.divergence, 3),
+                "convergence": round(flow.convergence, 3),
+                "counter_flow": round(flow.counter_flow, 3),
+            },
+            "zones": [
+                {
+                    "zone_id": z.zone_id,
+                    "label": z.label,
+                    "count": z.person_count,
+                    "density": round(z.density, 2),
+                }
+                for z in crowd.zones
+            ],
+        }
+        update_crowd_state(self.spec.id, state)
+
+        # Annotate live frame with crowd info (shown in MJPEG feed)
+        self._annotate_crowd_on_live_frame(frame, crowd, stampede)
+
+        # Write to DB on warning/critical or every snapshot_interval frames
+        crowd_needs_snapshot = (
+            stampede.level != "ok"
+            or crowd.risk_level != "ok"
+            or (frame_idx - self._last_snapshot_frame) >= self._snapshot_interval
+        )
+        if crowd_needs_snapshot and crowd.total_count > 0:
+            self._last_snapshot_frame = frame_idx
+            self._persist_crowd_snapshot(crowd, stampede)
+
+        # Push critical stampede event via WS
+        if stampede.level == "critical":
+            try:
+                from src.api.server import push_violation_event
+                push_violation_event({
+                    "type": "stampede",
+                    "camera_id": self.spec.id,
+                    "score": stampede.score,
+                    "level": stampede.level,
+                    "flags": stampede.flags,
+                    "total_count": crowd.total_count,
+                })
+            except Exception:
+                pass
+
+    def _run_violence_detection(
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        person_bboxes: list[tuple],
+    ) -> None:
+        result = self.pose_det.update(frame, frame_idx, person_bboxes)
+        changed = self.incident_mgr.update(result)
+        if changed is not None:
+            self._persist_violence_incident(changed)
+            if changed.status in ("active", "suspected"):
+                try:
+                    from src.api.server import push_violation_event
+                    push_violation_event({
+                        "type": "incident",
+                        "itype": "violence",
+                        "camera_id": self.spec.id,
+                        "status": changed.status,
+                        "score": changed.score,
+                        "flags": changed.flags,
+                        "db_id": changed.db_id,
+                    })
+                except Exception:
+                    pass
+
+    def _run_loitering(
+        self,
+        tracked: list[TrackedDetection],
+        frame_idx: int,
+    ) -> None:
+        persons = [
+            (td.track_id, *td.detection.xyxy)
+            for td in tracked
+            if td.detection.cls == ObjectClass.PERSON
+        ]
+        events = self.loiter_det.update(persons)
+        for ev in events:
+            self._persist_loiter_incident(ev)
+            try:
+                from src.api.server import push_violation_event
+                push_violation_event({
+                    "type": "incident",
+                    "itype": "loitering",
+                    "camera_id": ev.camera_id,
+                    "track_id": ev.track_id,
+                    "zone_id": ev.zone_id,
+                    "zone_label": ev.zone_label,
+                    "dwell_seconds": ev.dwell_seconds,
+                    "status": "active",
+                })
+            except Exception:
+                pass
+
+    def _run_abandoned(
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        person_bboxes: list[tuple],
+    ) -> None:
+        objects = self.abandon_det.update(frame, person_bboxes)
+        for obj in objects:
+            # Only push/persist every ~30 frames per object centroid
+            if frame_idx % 30 == 0:
+                self._persist_abandoned_incident(obj, frame_idx)
+                try:
+                    from src.api.server import push_violation_event
+                    push_violation_event({
+                        "type": "incident",
+                        "itype": "abandoned",
+                        "camera_id": self.spec.id,
+                        "age_frames": obj.age_frames,
+                        "centroid": obj.centroid,
+                        "status": "active",
+                    })
+                except Exception:
+                    pass
+
+    # ----------------------------------------------------- live frame annotator
+
+    def _annotate_crowd_on_live_frame(self, frame: np.ndarray, crowd, stampede) -> None:
+        """Overlay crowd stats on the live MJPEG frame buffer."""
+        try:
+            h, w = frame.shape[:2]
+            overlay = frame.copy()
+            # Semi-transparent dark strip at top
+            cv2.rectangle(overlay, (0, 0), (w, 28), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            level_color = {
+                "ok": (80, 200, 80),
+                "warning": (40, 170, 210),
+                "critical": (50, 50, 220),
+            }.get(stampede.level, (200, 200, 200))
+
+            txt = (
+                f"{self.spec.id}  |  persons:{crowd.total_count}"
+                f"  density:{crowd.max_density:.1f}p/m²"
+                f"  risk:{stampede.level.upper()}"
+            )
+            cv2.putText(frame, txt, (8, 18), font, 0.45, level_color, 1, cv2.LINE_AA)
+
+            # Write annotated frame to live buffer
+            update_live_frame(self.spec.id, frame, quality=65)
+        except Exception:
+            pass
+
+    # ----------------------------------------------------- DB persisters
+
+    def _persist_crowd_snapshot(self, crowd, stampede) -> None:
+        try:
+            from src.common.db import session_scope
+            from src.evidence.models import CrowdSnapshot
+            with session_scope() as s:
+                s.add(CrowdSnapshot(
+                    camera_id=self.spec.id,
+                    timestamp=datetime.utcnow(),
+                    total_count=crowd.total_count,
+                    max_density=crowd.max_density,
+                    stampede_score=stampede.score,
+                    stampede_level=stampede.level,
+                    stampede_flags=stampede.flags,
+                    zones_json=[
+                        {"id": z.zone_id, "label": z.label, "count": z.person_count, "density": round(z.density, 2)}
+                        for z in crowd.zones
+                    ],
+                ))
+        except Exception:
+            log.debug("crowd snapshot persist failed", exc_info=True)
+
+    def _persist_violence_incident(self, inc) -> None:
+        try:
+            from src.common.db import session_scope
+            from src.evidence.models import Incident
+            with session_scope() as s:
+                if inc.db_id is None:
+                    row = Incident(
+                        camera_id=inc.camera_id,
+                        itype="violence",
+                        started_at=inc.started_at,
+                        status=inc.status,
+                        score=inc.score,
+                        flags=inc.flags,
+                    )
+                    s.add(row)
+                    s.flush()
+                    inc.db_id = row.id
+                else:
+                    row = s.get(Incident, inc.db_id)
+                    if row:
+                        row.status = inc.status
+                        row.score = inc.score
+                        row.flags = inc.flags
+                        if inc.resolved_at:
+                            row.resolved_at = inc.resolved_at
+        except Exception:
+            log.debug("violence incident persist failed", exc_info=True)
+
+    def _persist_loiter_incident(self, ev) -> None:
+        try:
+            from src.common.db import session_scope
+            from src.evidence.models import Incident
+            with session_scope() as s:
+                s.add(Incident(
+                    camera_id=ev.camera_id,
+                    itype="loitering",
+                    started_at=datetime.utcnow(),
+                    status="active",
+                    score=min(ev.dwell_seconds / 120.0, 1.0),
+                    track_id=ev.track_id,
+                    zone_id=ev.zone_id,
+                    extras={"dwell_seconds": ev.dwell_seconds, "zone_label": ev.zone_label},
+                ))
+        except Exception:
+            log.debug("loiter incident persist failed", exc_info=True)
+
+    def _persist_abandoned_incident(self, obj, frame_idx: int) -> None:
+        try:
+            from src.common.db import session_scope
+            from src.evidence.models import Incident
+            with session_scope() as s:
+                s.add(Incident(
+                    camera_id=self.spec.id,
+                    itype="abandoned",
+                    started_at=datetime.utcnow(),
+                    status="active",
+                    score=min(obj.age_frames / 600.0, 1.0),
+                    extras={"age_frames": obj.age_frames, "centroid": list(obj.centroid), "bbox": list(obj.bbox)},
+                ))
+        except Exception:
+            log.debug("abandoned incident persist failed", exc_info=True)
+
+    # ----------------------------------------------------- traffic helpers
 
     def _best_plate_for_vehicle(self, vehicle: Detection, plates: list[Detection]) -> Optional[Detection]:
         best = None
@@ -281,7 +699,6 @@ class CameraPipeline:
     def _plate_crop_for_event(self, ev: ViolationEvent, bundle, frame: np.ndarray) -> Optional[np.ndarray]:
         if not ev.bbox:
             return None
-        # find plate inside the offender's vehicle box
         for p in bundle.of(ObjectClass.LICENSE_PLATE):
             if contains(ev.bbox, p.xyxy) >= 0.6:
                 return _crop(frame, p.xyxy)
@@ -298,7 +715,6 @@ class CameraPipeline:
         if not cfg.get("enabled"):
             return []
         out: list[ViolationEvent] = []
-        # Identify tracks we just lost: present last frame, absent this one.
         active = {td.track_id for td in tracked}
         lost = [tid for tid, last in self._track_last_seen_frame.items()
                 if last < frame_idx - 5 and tid not in active]
@@ -340,14 +756,11 @@ class CameraPipeline:
         color: Optional[str],
         vtype: Optional[str],
     ) -> None:
-        """Write/update the reid_subjects DB row (best-effort, non-blocking)."""
         try:
-            from datetime import datetime as _dt
-            from sqlalchemy import select
             from src.common.db import session_scope
             from src.evidence.models import ReidSubject
             plate_text, _ = self.rules.best_plate(td.track_id)
-            now = _dt.utcnow()
+            now = datetime.utcnow()
             with session_scope() as s:
                 row = s.get(ReidSubject, global_id)
                 if row is None:
@@ -369,8 +782,7 @@ class CameraPipeline:
                         row.plate_text = plate_text
                     cameras = row.camera_ids or []
                     if self.spec.id not in cameras:
-                        cameras = cameras + [self.spec.id]
-                        row.camera_ids = cameras
+                        row.camera_ids = cameras + [self.spec.id]
         except Exception:
             pass
 
@@ -388,7 +800,6 @@ class PipelineOrchestrator:
         from src.evidence.models import Base
         Base.metadata.create_all(bind=engine())
 
-        # Watchlist
         wl.load_from_csv(Path("data/watchlist_seed.csv"))
         wl.load_from_db()
         wl.start_background_reload()
@@ -405,9 +816,13 @@ class PipelineOrchestrator:
         self.store = EvidenceStore()
         self.rule_params = load_rules(settings.rules_yaml)
         self.cameras = load_cameras(settings.cameras_yaml)
+
+        # Expose rule_params so Settings API can mutate + persist it
+        global _shared_rule_params
+        with _rule_params_lock:
+            _shared_rule_params = self.rule_params
         self.pipelines: list[CameraPipeline] = []
 
-        # Shared cross-camera ReID (one embedder + one store shared across all cameras)
         global _shared_reid
         self.reid: Optional[CrossCameraReID] = None
         if settings.reid_enabled:
@@ -420,7 +835,6 @@ class PipelineOrchestrator:
             )
             _shared_reid = self.reid
 
-        # Shared vehicle attribute classifier (fast, CPU, no GPU needed)
         self.attr_clf = VehicleAttributeClassifier()
 
     def run(self) -> None:
