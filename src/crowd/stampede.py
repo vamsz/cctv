@@ -42,6 +42,18 @@ _WEIGHTS = {
 
 
 class StampedeDetector:
+    """
+    5-signal composite stampede risk scorer.
+
+    Optional learned classifier: when sklearn is installed and
+    `load_classifier(path)` is called with a fitted sklearn model,
+    the classifier replaces the hand-tuned threshold gating.
+    Train on UMN + PETS-2009 + GBA-Stampedes + GSMADC datasets
+    (Sciencedirect S0952197624020992 — ~43,000 frames, public).
+
+    Without a fitted model, uses the original heuristic thresholds.
+    """
+
     def __init__(
         self,
         danger_density: float = 7.0,
@@ -62,8 +74,64 @@ class StampedeDetector:
         self.convergence_min = convergence_min
         self.variance_min = variance_min
         self.counter_flow_min = counter_flow_min
+        self._classifier = None   # optional sklearn classifier
 
-    def assess(self, crowd: CrowdState, flow: FlowState) -> StampedeRisk:
+    def load_classifier(self, path: str) -> None:
+        """Load a pre-fitted sklearn classifier from a pickle file.
+
+        The model must accept a 1D feature vector of shape (5,):
+          [density_norm, divergence, convergence, velocity_variance, counter_flow]
+        and return predict_proba(X) → (P_ok, P_warning, P_critical).
+
+        Train on UMN + PETS-2009 + GBA-Stampedes + GSMADC (public datasets)
+        using scripts/train_stampede_classifier.py.
+        """
+        import pickle
+        with open(path, "rb") as f:
+            self._classifier = pickle.load(f)
+
+    def _classify_with_model(
+        self,
+        crowd: "CrowdState",
+        flow: "FlowState",
+    ) -> "StampedeRisk | None":
+        if self._classifier is None:
+            return None
+        try:
+            import numpy as np
+            density_norm = crowd.max_density / self.danger_density if crowd.max_density > 0 else 0.0
+            features = np.array([[
+                min(density_norm, 2.0),
+                flow.divergence if flow.valid else 0.0,
+                flow.convergence if flow.valid else 0.0,
+                min(flow.variance / 15.0, 2.0) if flow.valid else 0.0,
+                flow.counter_flow if flow.valid else 0.0,
+            ]], dtype=np.float32)
+            proba = self._classifier.predict_proba(features)[0]
+            classes = list(self._classifier.classes_)
+            def _p(label):
+                return proba[classes.index(label)] if label in classes else 0.0
+            p_crit = _p("critical")
+            p_warn = _p("warning")
+            score = round(float(p_crit * 0.9 + p_warn * 0.5), 3)
+            if p_crit >= 0.5:
+                level = "critical"
+            elif p_warn >= 0.5:
+                level = "warning"
+            else:
+                level = "ok"
+            return StampedeRisk(score=score, level=level, flags=[f"clf:crit={p_crit:.2f}"])
+        except Exception:
+            return None
+
+    def assess(self, crowd: "CrowdState", flow: "FlowState") -> StampedeRisk:
+        # Learned classifier takes precedence when loaded
+        clf_result = self._classify_with_model(crowd, flow)
+        if clf_result is not None:
+            return clf_result
+        return self._assess_heuristic(crowd, flow)
+
+    def _assess_heuristic(self, crowd: CrowdState, flow: FlowState) -> StampedeRisk:
         signals: dict[str, float] = {}
         flags: list[str] = []
 

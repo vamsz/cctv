@@ -48,6 +48,17 @@ class Settings(BaseSettings):
     pose_weights: str = "yolo11n-pose.pt"   # auto-downloads ~6MB; relative = ultralytics cache
     ocr_lang: str = "en"
 
+    # fast-alpr / fast-plate-ocr settings (Tier-1 upgrade)
+    use_fast_alpr: bool = True
+    fast_alpr_detector: str = "yolo-v9-t-384-license-plate-end2end"
+    fast_alpr_ocr_model: str = "global-plates-mobile-vit-v2-model"
+    # OCR fallback order: fast | paddle | easy (auto-selected by PlateOCR)
+    ocr_backend: str = "auto"
+
+    # violence Stage-2 clip classifier
+    violence_clip_model: str = "r3d_18"          # r3d_18 | mc3_18 | r2plus1d_18
+    violence_clip_threshold: float = 0.55
+
     # inference — auto-detects CUDA if not set in env
     device: str = ""
     max_fps: int = 15
@@ -85,9 +96,9 @@ class Settings(BaseSettings):
     evidence_retention_days: int = 180
     archive_s3_bucket: str = ""
 
-    # reid
+    # reid — DINOv2-Small uses 0.70 threshold (wider embedding spread than MobileNetV3)
     reid_enabled: bool = True
-    reid_threshold: float = 0.85         # cosine similarity threshold for cross-camera match
+    reid_threshold: float = 0.70         # DINOv2-Small: 0.70; MobileNetV3 fallback: 0.85
     reid_max_age_seconds: float = 300.0  # how long to keep embeddings in memory
     reid_extract_every_n: int = 15       # extract embedding every N frames per track
 

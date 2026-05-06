@@ -61,8 +61,14 @@ def _strip(plate: str) -> str:
 def normalize_indian_plate(raw: str) -> str | None:
     """Best-effort normalization of an OCR string to a valid Indian plate.
 
-    Tries multiple interpretations and corrections. Returns the canonical
-    form (e.g. 'TS09EA1234') or None if nothing works.
+    Tries multiple interpretations and corrections in priority order:
+      1. Direct match (no correction)
+      2. Position-aware char confusion correction
+      3. Artifact stripping (IND prefix etc.)
+      4. Substring search in longer strings
+      5. Beam-search over confusion candidates (edit distance ≤ 2)
+
+    Returns the canonical form (e.g. 'TS09EA1234') or None.
     """
     if not raw:
         return None
@@ -71,24 +77,24 @@ def normalize_indian_plate(raw: str) -> str | None:
     if len(s) < 6 or len(s) > 13:
         return None
 
-    # Try direct match first (no correction needed)
+    # 1. Direct match
     direct = _try_parse(s)
     if direct:
         return direct
 
-    # Try with position-aware corrections
+    # 2. Position-aware corrections
     corrected = _try_corrected(s)
     if corrected:
         return corrected
 
-    # Try removing common OCR artifacts (IND prefix, leading dots, etc.)
+    # 3. Artifact stripping
     for prefix in ("IND", "IN", "IMP"):
         if s.startswith(prefix) and len(s) > len(prefix) + 6:
             result = _try_corrected(s[len(prefix):])
             if result:
                 return result
 
-    # Try if there's a valid plate hiding inside a longer string
+    # 4. Substring search
     if len(s) > 10:
         for start in range(len(s) - 8):
             sub = s[start:start + 10]
@@ -96,7 +102,63 @@ def normalize_indian_plate(raw: str) -> str | None:
             if result:
                 return result
 
-    return None
+    # 5. Beam search over confusion candidates (catches multi-char OCR errors)
+    return _beam_search_normalize(s, beam_width=8)
+
+
+def _beam_search_normalize(s: str, beam_width: int = 8) -> str | None:
+    """Try all single + double character confusion substitutions.
+
+    Generates candidate strings by replacing characters with their
+    confusion pairs (O↔0, I↔1, S↔5, B↔8, Z↔2, E↔3, A↔4, G↔6, T↔7).
+    Uses a beam to limit the search to the top `beam_width` candidates.
+    """
+    # All confusion pairs (bidirectional)
+    CONFUSIONS: dict[str, list[str]] = {
+        "O": ["0"], "0": ["O"],
+        "I": ["1", "L"], "1": ["I", "L"], "L": ["1", "I"],
+        "S": ["5"], "5": ["S"],
+        "B": ["8"], "8": ["B"],
+        "Z": ["2"], "2": ["Z"],
+        "E": ["3"], "3": ["E"],
+        "A": ["4"], "4": ["A"],
+        "G": ["6"], "6": ["G"],
+        "T": ["7"], "7": ["T"],
+        "Q": ["0"], "D": ["0"],
+        "J": ["1"], "R": ["2"],
+        "C": ["6"], "Y": ["7"],
+        "H": ["4"], "P": ["9"], "9": ["P"],
+    }
+
+    # Start with the original string as the only candidate
+    # Score = number of substitutions (lower is better)
+    beam: list[tuple[int, str]] = [(0, s)]
+    seen: set[str] = {s}
+    best: str | None = None
+
+    for _depth in range(min(len(s), 4)):   # max 4 substitutions
+        next_beam: list[tuple[int, str]] = []
+        for cost, candidate in beam:
+            for i, ch in enumerate(candidate):
+                for replacement in CONFUSIONS.get(ch, []):
+                    new_s = candidate[:i] + replacement + candidate[i + 1:]
+                    if new_s in seen:
+                        continue
+                    seen.add(new_s)
+                    result = _try_corrected(new_s)
+                    if result:
+                        if best is None:
+                            best = result  # first valid hit wins
+                        continue
+                    next_beam.append((cost + 1, new_s))
+        if best:
+            return best
+        # Keep best beam_width candidates (fewest substitutions)
+        beam = sorted(next_beam, key=lambda x: x[0])[:beam_width]
+        if not beam:
+            break
+
+    return best
 
 
 def _try_parse(s: str) -> str | None:

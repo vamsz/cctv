@@ -31,10 +31,12 @@ import yaml
 from config.settings import settings
 from src.attributes.classifier import VehicleAttributeClassifier
 from src.crowd.calibration import CameraCalibration
+from src.crowd.dense_counter import DenseCrowdCounter
 from src.crowd.density import ZoneDensityEstimator
 from src.crowd.flow import FlowAnalyzer
 from src.crowd.stampede import StampedeDetector
 from src.detection.classes import ObjectClass, VEHICLE_CLASSES
+from src.violence.clip_classifier import ViolenceClipClassifier
 from src.detection.detector import Detection, Detector
 from src.evidence.store import EvidenceStore
 from src.ingest.stream import StreamConfig, StreamReader
@@ -230,6 +232,13 @@ class CameraPipeline:
             weights=settings.pose_weights,
         )
         self.incident_mgr = IncidentManager(spec.id)
+        # Stage-2 clip classifier — confirms "suspected" before escalating to "active"
+        self._clip_clf = ViolenceClipClassifier(
+            device=settings.device,
+            threshold=float(violence_cfg.get("clip_confirm_threshold", 0.55)),
+            model_name=str(violence_cfg.get("clip_model", "r3d_18")),
+        )
+        self._clip_confirmation: dict[str, bool] = {}   # camera_id → latest clip result
 
         # ── Loitering ────────────────────────────────────────────────────
         loiter_cfg = rule_params.get("loitering", {})
@@ -245,9 +254,19 @@ class CameraPipeline:
         aband_cfg = rule_params.get("abandoned", {})
         self._abandoned_enabled = bool(aband_cfg.get("enabled", True))
         self.abandon_det = AbandonedObjectDetector(
-            min_frames=int(aband_cfg.get("min_frames", 150)),
-            min_area_px2=int(aband_cfg.get("min_area_px2", 2500)),
+            min_frames=int(aband_cfg.get("min_frames", 300)),
+            min_area_px2=int(aband_cfg.get("min_area_px2", 3000)),
             person_iou_thresh=float(aband_cfg.get("person_iou_threshold", 0.15)),
+            owner_bind_radius=int(aband_cfg.get("owner_bind_radius_px", 200)),
+            owner_separation=int(aband_cfg.get("owner_separation_px", 300)),
+            static_frames=int(aband_cfg.get("static_frames", 300)),
+        )
+
+        # ── Dense crowd counter ───────────────────────────────────────────
+        crowd_cfg2 = rule_params.get("crowd", {})
+        self.dense_counter = DenseCrowdCounter(
+            dense_trigger_count=int(crowd_cfg2.get("dense_trigger_count", 30)),
+            device=settings.device,
         )
 
         self._stop = threading.Event()
@@ -311,6 +330,15 @@ class CameraPipeline:
         # Attach plates → tracks by IoU, run OCR, propagate to rules engine.
         plate_dets = bundle.of(ObjectClass.LICENSE_PLATE)
         person_bboxes: list[tuple] = []
+        luggage_dets: list[tuple] = []
+
+        # Collect luggage detections for owner-association abandoned object detection
+        for ld in bundle.of(ObjectClass.LUGGAGE):
+            luggage_dets.append((ld.xyxy[0], ld.xyxy[1], ld.xyxy[2], ld.xyxy[3]))
+
+        # Feed frame to clip violence classifier buffer every frame
+        if self._violence_enabled and self._clip_clf.available:
+            self._clip_clf.submit_frame(self.spec.id, frame)
 
         for td in tracked:
             cls = td.detection.cls
@@ -359,6 +387,13 @@ class CameraPipeline:
             plate = self._best_plate_for_vehicle(td.detection, plate_dets)
             if plate is None:
                 continue
+            # fast-alpr pre-reads the text — skip OCR entirely
+            if plate.text and plate.text_conf is not None and plate.text_conf >= 0.30:
+                normalized = normalize_indian_plate(plate.text)
+                if normalized:
+                    self.rules.attach_plate_read(td.track_id, normalized, plate.text_conf)
+                continue
+            # Legacy: crop + PlateOCR
             crop = _crop(frame, plate.xyxy)
             read = self.ocr.read(crop)
             if not read:
@@ -421,7 +456,7 @@ class CameraPipeline:
 
         # ── Step 3: Abandoned object detection ───────────────────────────
         if self._abandoned_enabled:
-            self._run_abandoned(frame, frame_idx, person_bboxes)
+            self._run_abandoned(frame, frame_idx, person_bboxes, luggage_dets)
 
     # ----------------------------------------------------- Step 3 helpers
 
@@ -436,10 +471,17 @@ class CameraPipeline:
         flow_smooth = self.flow_analyzer.smoothed()
         stampede = self.stampede_det.assess(crowd, flow_smooth)
 
+        # Dense-crowd correction: YOLO under-counts above ~30 persons/frame
+        adjusted_count = self.dense_counter.get_adjusted_count(
+            crowd.total_count, person_bboxes, frame
+        )
+
         state = {
             "camera_id": self.spec.id,
             "timestamp": datetime.utcnow().isoformat(),
-            "total_count": crowd.total_count,
+            "total_count": adjusted_count,
+            "yolo_raw_count": crowd.total_count,
+            "dense_mode": self.dense_counter.mode if adjusted_count != crowd.total_count else "yolo",
             "max_density": crowd.max_density,
             "risk_level": crowd.risk_level,
             "stampede_score": stampede.score,
@@ -492,6 +534,14 @@ class CameraPipeline:
             except Exception:
                 pass
 
+    def _on_clip_result(self, result) -> None:
+        """Callback from async clip classifier."""
+        self._clip_confirmation[result.camera_id] = result.confirmed
+        log.debug(
+            "[%s] clip result: score=%.3f confirmed=%s label=%s",
+            result.camera_id, result.score, result.confirmed, result.label,
+        )
+
     def _run_violence_detection(
         self,
         frame: np.ndarray,
@@ -499,6 +549,16 @@ class CameraPipeline:
         person_bboxes: list[tuple],
     ) -> None:
         result = self.pose_det.update(frame, frame_idx, person_bboxes)
+
+        # Stage-2 gate: when pose heuristic fires "suspected", request a clip check
+        if result.active and self._clip_clf.available:
+            self._clip_clf.request_inference(self.spec.id, self._on_clip_result)
+            # If clip classifier hasn't confirmed yet, hold at suspected
+            if not self._clip_confirmation.get(self.spec.id, False):
+                # Force only "suspected" until clip confirms
+                from dataclasses import replace as dc_replace
+                result = dc_replace(result, active=False)
+
         changed = self.incident_mgr.update(result)
         if changed is not None:
             self._persist_violence_incident(changed)
@@ -550,8 +610,13 @@ class CameraPipeline:
         frame: np.ndarray,
         frame_idx: int,
         person_bboxes: list[tuple],
+        luggage_dets: Optional[list[tuple]] = None,
     ) -> None:
-        objects = self.abandon_det.update(frame, person_bboxes)
+        objects = self.abandon_det.update(
+            frame,
+            person_bboxes,
+            object_detections=luggage_dets if luggage_dets else None,
+        )
         for obj in objects:
             # Only push/persist every ~30 frames per object centroid
             if frame_idx % 30 == 0:
@@ -811,6 +876,7 @@ class PipelineOrchestrator:
             device=settings.device,
             conf=settings.det_conf,
             use_sahi_plate=settings.sahi_plate_enabled,
+            use_fast_alpr=settings.use_fast_alpr,
         )
         self.ocr = PlateOCR(lang=settings.ocr_lang, use_gpu=settings.device.startswith("cuda"))
         self.store = EvidenceStore()

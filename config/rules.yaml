@@ -94,6 +94,7 @@ crowd:
 # ---- Violence detection — India-tuned --------------------------------------
 # Indians gesture animatedly in normal conversation. Raise thresholds to
 # avoid false positives from normal heated argument / bargaining gestures.
+# Stage-2: R3D-18 Kinetics-400 clip classifier confirms before "active" escalation.
 
 violence:
   enabled: true
@@ -104,6 +105,9 @@ violence:
   # Proximity IoU: 0.08 — Indian crowds naturally stand closer together
   proximity_iou: 0.08              # was 0.12; dense crowds make 0.12 too noisy
   incident_cooldown_seconds: 60
+  # Stage-2 clip classifier (R3D-18, Apache 2.0, Kinetics-400 pretrained)
+  clip_model: "r3d_18"             # r3d_18 | mc3_18 | r2plus1d_18
+  clip_confirm_threshold: 0.55     # violence probability > this → confirmed active
 
 # ---- Loitering detection — India-tuned ------------------------------------
 # Street vendors, tea stalls, autorickshaw drivers routinely sit for hours.
@@ -116,11 +120,25 @@ loitering:
   min_track_frames: 15
   cooldown_seconds: 120
 
-# ---- Abandoned object detection -------------------------------------------
+# ---- Abandoned object detection — owner-association (upgraded) ------------
+# Now uses YOLO luggage classes (backpack=24, handbag=26, suitcase=28) +
+# owner binding (nearest person within bind_radius at first sight).
+# Falls back to MOG2 background subtraction when no luggage detected.
+# Reference: Russel & Selvaraj 2024 (Vis Comput 40:4401-4426)
 
 abandoned:
   enabled: true
-  # ~20 seconds at 15fps before flagging as abandoned
-  min_frames: 300                  # was 150; Indian street clutter is high
-  min_area_px2: 3000               # slightly larger to ignore small debris
+  min_frames: 300                  # ~20 s at 15fps; Indian street clutter is high
+  min_area_px2: 3000
   person_iou_threshold: 0.15
+  owner_bind_radius_px: 200        # max pixels to bind owner at object first-sight
+  owner_separation_px: 300         # owner "away" if centroid > this from object
+  static_frames: 300               # object must be stationary for this long
+
+# ---- Dense crowd counting — correction above 30 persons/frame -------------
+# YOLO person detection saturates above ~30 heads/frame (Kumbh-level crowds).
+# Enable CLIP-EBC for better accuracy: git clone CLIP-EBC && pip install -e.
+# Without CLIP-EBC, an empirical correction factor is applied automatically.
+
+crowd_dense:
+  dense_trigger_count: 30          # switch to dense mode above this YOLO count

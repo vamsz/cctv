@@ -40,6 +40,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -61,6 +62,7 @@ log = get_logger("api")
 
 app = FastAPI(title="CCTV Enforcement Review", version="2.0.0", docs_url="/api/docs", redoc_url=None)
 
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -335,7 +337,10 @@ def evidence(key: str):
     if not store.exists(key):
         raise HTTPException(status_code=404, detail="not found")
     data = store.get_bytes(key)
-    return StreamingResponse(io.BytesIO(data), media_type="image/jpeg")
+    return StreamingResponse(
+        io.BytesIO(data), media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 # ----------------------------------------------------------------- stats / cameras

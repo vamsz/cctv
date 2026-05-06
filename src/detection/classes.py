@@ -17,6 +17,10 @@ COCO_MOTORCYCLE = 3
 COCO_BUS = 5
 COCO_TRUCK = 7
 COCO_TRAFFIC_LIGHT = 9
+# Luggage classes — used by AbandonedObjectDetector owner-association
+COCO_BACKPACK = 24
+COCO_HANDBAG = 26
+COCO_SUITCASE = 28
 
 
 class ObjectClass(str, Enum):
@@ -29,6 +33,7 @@ class ObjectClass(str, Enum):
     LICENSE_PLATE = "license_plate"
     HELMET = "helmet"
     NO_HELMET = "no_helmet"
+    LUGGAGE = "luggage"                  # backpack, handbag, suitcase
 
 
 COCO_TO_CLASS: dict[int, ObjectClass] = {
@@ -39,6 +44,9 @@ COCO_TO_CLASS: dict[int, ObjectClass] = {
     COCO_BUS: ObjectClass.BUS,
     COCO_TRUCK: ObjectClass.TRUCK,
     COCO_TRAFFIC_LIGHT: ObjectClass.TRAFFIC_LIGHT,
+    COCO_BACKPACK: ObjectClass.LUGGAGE,
+    COCO_HANDBAG: ObjectClass.LUGGAGE,
+    COCO_SUITCASE: ObjectClass.LUGGAGE,
 }
 
 VEHICLE_CLASSES = {

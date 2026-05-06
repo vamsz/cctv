@@ -2,12 +2,34 @@ ultralytics==8.3.40
 supervision==0.25.1
 opencv-python-headless==4.10.0.84
 numpy==1.26.4
+
+# ── License plate OCR — tiered backends (auto-selected at runtime) ──────────
+# Priority 1: fast-plate-ocr (MIT) — 3 ms CPU, 1 ms GPU. 200-400x faster than EasyOCR.
+fast-plate-ocr>=0.3.0
+# Priority 2: fast-alpr — end-to-end detector + OCR in one ONNX forward pass
+fast-alpr>=0.2.0
+# ONNX runtime — required by fast-plate-ocr and fast-alpr
+onnxruntime>=1.18.0
+# Priority 3: PaddleOCR >= 3.0.3 (Windows MKLDNN fix confirmed in changelog)
+# Uncomment when you want the PaddleOCR fallback:
+# paddleocr>=3.0.3
+# paddlepaddle>=3.0.0
+# Priority 4 (legacy fallback, always installed):
 easyocr==1.7.2
 
-# ReID — optional but recommended; falls back to numpy cosine search
+# ── ReID embedder — DINOv2-Small (MIT, 384-d, replaces MobileNetV3-Small) ───
+transformers>=4.40.0
+# tokenizers is a transformers transitive dep but pinning avoids install issues
+tokenizers>=0.15.0
+
+# ── Violence Stage-2 clip classifier (R3D-18, Kinetics-400, Apache 2.0) ─────
+# torchvision already ships with ultralytics, but pin video models support:
+torchvision>=0.17.0
+
+# ── ReID store ───────────────────────────────────────────────────────────────
 faiss-cpu
 
-# API + DB
+# ── API + DB ─────────────────────────────────────────────────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 gunicorn==23.0.0
@@ -17,16 +39,16 @@ psycopg2-binary==2.9.10
 pydantic==2.10.2
 pydantic-settings==2.6.1
 
-# Auth + crypto + audit
+# ── Auth + crypto + audit ────────────────────────────────────────────────────
 passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
 cryptography==43.0.3
 python-multipart==0.0.19
 
-# Ops
+# ── Ops ──────────────────────────────────────────────────────────────────────
 pyyaml==6.0.2
 jinja2==3.1.4
-pillow==11.0.0
+pillow>=10.0.0
 shapely==2.0.6
 prometheus-client==0.21.1
 structlog==24.4.0
@@ -36,3 +58,10 @@ watchfiles==0.24.0
 boto3==1.35.74
 redis==5.2.0
 httpx==0.28.0
+
+# ── Optional: CLIP-EBC dense crowd counter (MIT, manual install from source) ─
+# git clone https://github.com/Yiming-M/CLIP-EBC && pip install -e ./CLIP-EBC
+# openai-clip>=1.0.1  (installed automatically by CLIP-EBC)
+
+# ── Optional: stampede shallow classifier (standard sklearn) ─────────────────
+scikit-learn>=1.4.0

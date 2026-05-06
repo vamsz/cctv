@@ -32,7 +32,7 @@ class CrossCameraReID:
     ):
         self.embedder = VehicleEmbedder(device=device)
         self.store = ReIDStore(
-            dim=VehicleEmbedder.DIM,
+            dim=self.embedder.DIM,
             max_age_seconds=max_age_seconds,
             cosine_threshold=cosine_threshold,
         )

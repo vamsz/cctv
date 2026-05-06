@@ -23,6 +23,7 @@ import numpy as np
 from ultralytics import YOLO
 
 from .classes import COCO_TO_CLASS, ObjectClass
+from .plate_alpr import ALPRDetector
 
 
 @dataclass
@@ -30,6 +31,8 @@ class Detection:
     cls: ObjectClass
     conf: float
     xyxy: tuple[float, float, float, float]   # x1, y1, x2, y2 in pixels
+    text: Optional[str] = None           # pre-read plate text (from fast-alpr)
+    text_conf: Optional[float] = None    # OCR confidence when text is pre-read
 
     @property
     def cx(self) -> float:
@@ -67,6 +70,7 @@ class Detector:
         device: str = "cuda:0",
         conf: float = 0.35,
         use_sahi_plate: bool = False,
+        use_fast_alpr: bool = True,
     ):
         self.device = device
         self.conf = conf
@@ -77,11 +81,20 @@ class Detector:
         if helmet_weights and Path(helmet_weights).exists():
             self.helmet = YOLO(str(helmet_weights))
 
-        self.plate = None
-        if plate_weights and Path(plate_weights).exists():
-            self.plate = YOLO(str(plate_weights))
+        # fast-alpr: try first; if unavailable, fall back to plate.pt
+        self._alpr: Optional[ALPRDetector] = None
+        if use_fast_alpr:
+            alpr = ALPRDetector(device=device, conf=conf)
+            if alpr.available:
+                self._alpr = alpr
 
-        if self.use_sahi_plate and self.plate is None:
+        self.plate = None
+        if self._alpr is None:
+            # Only load plate.pt when fast-alpr is not available
+            if plate_weights and Path(plate_weights).exists():
+                self.plate = YOLO(str(plate_weights))
+
+        if self.use_sahi_plate and self.plate is None and self._alpr is None:
             self.use_sahi_plate = False
 
     def __call__(self, frame: np.ndarray, frame_idx: int, timestamp: float) -> DetectionBundle:
@@ -117,8 +130,19 @@ class Detector:
                         continue
                     bundle.detections.append(Detection(cls=cls, conf=float(c), xyxy=tuple(map(float, box))))
 
-        # --- plate head ---
-        if self.plate is not None:
+        # --- plate head: fast-alpr (preferred) or legacy plate.pt ---
+        if self._alpr is not None:
+            for xyxy_box, text, text_c in self._alpr.detect(frame):
+                bundle.detections.append(
+                    Detection(
+                        cls=ObjectClass.LICENSE_PLATE,
+                        conf=text_c,
+                        xyxy=xyxy_box,
+                        text=text,
+                        text_conf=text_c if text else None,
+                    )
+                )
+        elif self.plate is not None:
             if self.use_sahi_plate:
                 from .plate_sahi import detect_plates_sliced
                 for xyxy_box, c in detect_plates_sliced(

@@ -39,7 +39,11 @@
       "PowerShell(Get-Process *)",
       "PowerShell(Start-Sleep -Seconds 6; $body = '{\"email\":\"admin@local\",\"password\":\"admin\"}'; $resp = Invoke-RestMethod -Uri \"http://localhost:8000/auth/login\" -Method POST -Body $body -ContentType \"application/json\"; $token = $resp.access_token; $headers = @{\"Authorization\"=\"Bearer $token\"}; $subjects = Invoke-RestMethod -Uri \"http://localhost:8000/api/reid/subjects\" -Headers $headers; Write-Host \"Subjects from API: $\\($subjects.Count\\)\"; $subjects | ConvertTo-Json -Depth 3)",
       "Bash(findstr -v \"Warning\")",
-      "Bash(Test-Path C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\Dockerfile *)"
+      "Bash(Test-Path C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\Dockerfile *)",
+      "Bash(python *)",
+      "Bash(dir *.md)",
+      "Bash(dir plan*.md)",
+      "Bash(dir PLAN*.md)"
     ]
   }
 }
