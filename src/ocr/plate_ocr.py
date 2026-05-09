@@ -128,10 +128,16 @@ def _paddle_read(reader, img: np.ndarray) -> Optional[PlateRead]:
 # ---------------------------------------------------------------------------
 
 def _try_build_easyocr(lang: str = "en", use_gpu: bool = False):
-    import easyocr
-    reader = easyocr.Reader([lang], gpu=use_gpu, verbose=False)
-    log.info("PlateOCR backend: EasyOCR (legacy fallback)")
-    return reader, "easy"
+    try:
+        import easyocr
+        reader = easyocr.Reader([lang], gpu=use_gpu, verbose=False)
+        log.info("PlateOCR backend: EasyOCR (legacy fallback)")
+        return reader, "easy"
+    except ImportError:
+        return None, None
+    except Exception as exc:
+        log.warning("EasyOCR init failed (%s)", exc)
+        return None, None
 
 
 def _easyocr_read(reader, img: np.ndarray) -> Optional[PlateRead]:
@@ -274,6 +280,9 @@ class PlateOCR:
     ):
         self._backend = None
         self._reader = None
+        self._lang = lang
+        self._use_gpu = use_gpu
+        self._easy_reader = None  # lazy fallback reader when primary backend fails
 
         # Priority 1: fast-plate-ocr
         reader, backend = _try_build_fast_ocr(fast_ocr_model)
@@ -297,13 +306,31 @@ class PlateOCR:
     def backend(self) -> str:
         return self._backend or "none"
 
+    def _easyocr_ensemble(self, plate_crop: np.ndarray) -> Optional[PlateRead]:
+        """Run EasyOCR multi-variant ensemble. Lazy-initialises the reader."""
+        if self._easy_reader is None:
+            reader, _ = _try_build_easyocr(self._lang, self._use_gpu)
+            self._easy_reader = reader  # may stay None if easyocr not installed
+        if self._easy_reader is None:
+            return None
+        candidates: list[PlateRead] = []
+        for variant in _preprocess_crop(plate_crop):
+            r = _easyocr_read(self._easy_reader, variant)
+            if r:
+                candidates.append(r)
+        return max(candidates, key=_score) if candidates else None
+
     def read(self, plate_crop: np.ndarray) -> Optional[PlateRead]:
         if plate_crop is None or plate_crop.size == 0:
             return None
 
-        # fast-plate-ocr: single pass on original crop (model handles sizing internally)
+        # fast-plate-ocr: single pass; fall back to EasyOCR ensemble when it returns None
         if self._backend == "fast":
-            return _fast_read(self._reader, plate_crop)
+            result = _fast_read(self._reader, plate_crop)
+            if result is not None:
+                return result
+            log.debug("fast-plate-ocr returned None — falling back to EasyOCR ensemble")
+            return self._easyocr_ensemble(plate_crop)
 
         # PaddleOCR / EasyOCR: multi-variant ensemble
         read_fn = _paddle_read if self._backend == "paddle" else _easyocr_read

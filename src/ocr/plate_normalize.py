@@ -227,6 +227,46 @@ def _candidate_splits_old(s: str):
                 )
 
 
+# ---------------------------------------------------------------------------
+# International plate normalization
+# ---------------------------------------------------------------------------
+
+# UK format: AB12CDE  (2 alpha + 2 digit + 3 alpha, 7 chars)
+_UK_FORMAT = re.compile(r"^[A-Z]{2}\d{2}[A-Z]{3}$")
+
+# EU/generic: 4-12 alphanumeric chars (good-faith catch-all for non-Indian plates)
+_GENERIC_MIN = 4
+_GENERIC_MAX = 12
+
+
+def normalize_plate(raw: str) -> str | None:
+    """Normalize any plate: tries Indian first, then UK, then generic alphanumeric.
+
+    Returns cleaned text if the raw string plausibly represents a plate,
+    or None when it is clearly garbage (< 4 or > 12 alphanumeric chars).
+    """
+    if not raw:
+        return None
+
+    # Try Indian format (strictest — position-aware corrections + validation)
+    indian = normalize_indian_plate(raw)
+    if indian:
+        return indian
+
+    # Clean to alphanumeric only
+    s = re.sub(r"[^A-Z0-9]", "", raw.upper())
+
+    if len(s) < _GENERIC_MIN or len(s) > _GENERIC_MAX:
+        return None
+
+    # UK format exact match
+    if _UK_FORMAT.match(s):
+        return s
+
+    # Generic: accept any 4-12 alphanumeric string (handles EU, US, etc.)
+    return s
+
+
 def is_valid_indian_plate(plate: str) -> bool:
     return normalize_indian_plate(plate) is not None
 

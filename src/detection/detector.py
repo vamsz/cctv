@@ -22,8 +22,12 @@ from typing import Optional
 import numpy as np
 from ultralytics import YOLO
 
+import logging
+
 from .classes import COCO_TO_CLASS, ObjectClass
 from .plate_alpr import ALPRDetector
+
+log = logging.getLogger("detection.detector")
 
 
 @dataclass
@@ -75,11 +79,17 @@ class Detector:
         self.device = device
         self.conf = conf
         self.use_sahi_plate = use_sahi_plate
+        self._half = device.startswith("cuda")  # fp16 — CUDA only, ~1.5-2x faster
         self.general = YOLO(str(general_weights))
 
         self.helmet = None
         if helmet_weights and Path(helmet_weights).exists():
+            # Auto-upgrade: prefer fine-tuned helmet_ft.pt when it exists next to helmet.pt
+            ft = Path(helmet_weights).parent / "helmet_ft.pt"
+            if ft.exists():
+                helmet_weights = ft
             self.helmet = YOLO(str(helmet_weights))
+            log.info("Helmet model: %s", Path(helmet_weights).name)
 
         # fast-alpr: try first; if unavailable, fall back to plate.pt
         self._alpr: Optional[ALPRDetector] = None
@@ -92,16 +102,95 @@ class Detector:
         if self._alpr is None:
             # Only load plate.pt when fast-alpr is not available
             if plate_weights and Path(plate_weights).exists():
+                # Auto-upgrade: prefer plate_ft.pt (fine-tuned) over plate.pt
+                pt_ft = Path(plate_weights).parent / "plate_ft.pt"
+                if pt_ft.exists():
+                    plate_weights = pt_ft
                 self.plate = YOLO(str(plate_weights))
+                log.info("Plate model: %s", Path(plate_weights).name)
 
         if self.use_sahi_plate and self.plate is None and self._alpr is None:
             self.use_sahi_plate = False
+
+    def _parse_helmet_results(self, res) -> list[Detection]:
+        names = res.names
+        out: list[Detection] = []
+        if res.boxes is None or len(res.boxes) == 0:
+            return out
+        xyxy_arr = res.boxes.xyxy.cpu().numpy()
+        confs_arr = res.boxes.conf.cpu().numpy()
+        clses_arr = res.boxes.cls.cpu().numpy().astype(int)
+        for box, c, k in zip(xyxy_arr, confs_arr, clses_arr):
+            label = names[int(k)].lower()
+            if ("no" in label or "without" in label) and "helmet" in label:
+                cls = ObjectClass.NO_HELMET
+            elif "helmet" in label:
+                cls = ObjectClass.HELMET
+            else:
+                continue
+            out.append(Detection(cls=cls, conf=float(c), xyxy=tuple(map(float, box))))
+        return out
+
+    def _helmet_full_frame(self, frame: np.ndarray) -> list[Detection]:
+        res = self.helmet.predict(frame, device=self.device, conf=self.conf, verbose=False, half=self._half)[0]
+        return self._parse_helmet_results(res)
+
+    def _helmet_two_stage(self, frame: np.ndarray, riders: list[Detection]) -> list[Detection]:
+        """Crop the upper 45 % of each rider bbox and run the helmet model in one batched call.
+
+        Rationale: the head occupies the top portion of a person/bike bounding box.
+        Isolating it at full crop resolution dramatically boosts recall for small helmets
+        and reduces false positives from unrelated objects elsewhere in the frame.
+        All crops are forwarded in a single batched GPU call for efficiency.
+        """
+        h_frame, w_frame = frame.shape[:2]
+
+        # Collect valid crops + their offsets for coordinate remapping
+        crops: list[np.ndarray] = []
+        offsets: list[tuple[int, int]] = []   # (cx1, cy1) per crop
+
+        for rider in riders:
+            rx1, ry1, rx2, ry2 = rider.xyxy
+            # Upper 45 % covers head + shoulders for both standing persons and seated riders
+            cy2_raw = ry1 + (ry2 - ry1) * 0.45
+            cx1 = max(0, int(rx1))
+            cy1 = max(0, int(ry1))
+            cx2 = min(w_frame, int(rx2))
+            cy2 = min(h_frame, int(cy2_raw))
+
+            if cx2 - cx1 < 24 or cy2 - cy1 < 24:
+                continue  # crop too small — skip
+
+            crops.append(frame[cy1:cy2, cx1:cx2])
+            offsets.append((cx1, cy1))
+
+        if not crops:
+            return []
+
+        # Single batched inference — YOLO accepts a list of images
+        results = self.helmet.predict(crops, device=self.device, conf=self.conf, verbose=False, half=self._half)
+
+        out: list[Detection] = []
+        seen: set[tuple] = set()  # deduplicate by (cls, rounded_box)
+
+        for res, (ox, oy) in zip(results, offsets):
+            for det in self._parse_helmet_results(res):
+                bx1, by1, bx2, by2 = det.xyxy
+                fx1, fy1 = float(bx1) + ox, float(by1) + oy
+                fx2, fy2 = float(bx2) + ox, float(by2) + oy
+                key = (det.cls, round(fx1), round(fy1), round(fx2), round(fy2))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(Detection(cls=det.cls, conf=det.conf, xyxy=(fx1, fy1, fx2, fy2)))
+
+        return out
 
     def __call__(self, frame: np.ndarray, frame_idx: int, timestamp: float) -> DetectionBundle:
         bundle = DetectionBundle(frame_idx=frame_idx, timestamp=timestamp)
 
         # --- general model ---
-        res = self.general.predict(frame, device=self.device, conf=self.conf, verbose=False)[0]
+        res = self.general.predict(frame, device=self.device, conf=self.conf, verbose=False, half=self._half)[0]
         if res.boxes is not None and len(res.boxes) > 0:
             xyxy = res.boxes.xyxy.cpu().numpy()
             confs = res.boxes.conf.cpu().numpy()
@@ -112,23 +201,14 @@ class Detector:
                     continue
                 bundle.detections.append(Detection(cls=cls, conf=float(c), xyxy=tuple(map(float, box))))
 
-        # --- helmet head ---
+        # --- helmet head: two-stage (crop upper-body of each rider, then classify) ---
         if self.helmet is not None:
-            res = self.helmet.predict(frame, device=self.device, conf=self.conf, verbose=False)[0]
-            names = res.names  # {0: 'helmet', 1: 'no_helmet'} or similar
-            if res.boxes is not None and len(res.boxes) > 0:
-                xyxy = res.boxes.xyxy.cpu().numpy()
-                confs = res.boxes.conf.cpu().numpy()
-                clses = res.boxes.cls.cpu().numpy().astype(int)
-                for box, c, k in zip(xyxy, confs, clses):
-                    label = names[int(k)].lower()
-                    if ("no" in label or "without" in label) and "helmet" in label:
-                        cls = ObjectClass.NO_HELMET
-                    elif "helmet" in label:
-                        cls = ObjectClass.HELMET
-                    else:
-                        continue
-                    bundle.detections.append(Detection(cls=cls, conf=float(c), xyxy=tuple(map(float, box))))
+            riders = bundle.of_any({ObjectClass.TWO_WHEELER, ObjectClass.PERSON})
+            if riders:
+                bundle.detections.extend(self._helmet_two_stage(frame, riders))
+            else:
+                # No riders detected — fall back to full-frame pass
+                bundle.detections.extend(self._helmet_full_frame(frame))
 
         # --- plate head: fast-alpr (preferred) or legacy plate.pt ---
         if self._alpr is not None:
@@ -152,7 +232,7 @@ class Detector:
                         Detection(cls=ObjectClass.LICENSE_PLATE, conf=c, xyxy=xyxy_box)
                     )
             else:
-                res = self.plate.predict(frame, device=self.device, conf=self.conf, verbose=False)[0]
+                res = self.plate.predict(frame, device=self.device, conf=self.conf, verbose=False, half=self._half)[0]
                 if res.boxes is not None and len(res.boxes) > 0:
                     xyxy = res.boxes.xyxy.cpu().numpy()
                     confs = res.boxes.conf.cpu().numpy()

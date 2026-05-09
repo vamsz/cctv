@@ -1,21 +1,16 @@
 """Stage-2 violence clip classifier — async background worker.
 
-Uses torchvision R3D-18 (3D ResNet-18, Apache 2.0, Kinetics-400 pretrained)
-to confirm or reject a "suspected" violence incident via 16-frame clip inference.
+Primary model: VideoMAE fine-tuned on UCF-Crime CCTV dataset
+  HuggingFace: OPear/videomae-large-finetuned-UCF-Crime
+  92.96% validation accuracy, 14 crime classes, trained on real surveillance footage.
+  Classes include: Fighting, Assault, Abuse, Robbery, Shooting + Normal Videos, etc.
 
-Architecture per improvement plan:
-  - Stage-1 (pose heuristics) raises "suspected" when ≥ 2 of 4 signals active.
-  - Stage-2 (this module) samples last 2 s / 16 frames from a rolling buffer.
-  - R3D-18 → Kinetics-400 class probabilities.
-  - violence_score = sum(probs for violence-related K400 classes).
-  - If score > threshold (default 0.55) → incident confirmed "active".
-  - Runs in a background thread — does NOT block the main pipeline.
+Fallback: torchvision R3D-18 Kinetics-400 (if transformers not installed).
 
-To fine-tune on RWF-2000 for best results (~89% accuracy per IDG-ViolenceNet 2025):
-  python scripts/finetune_violence.py  --dataset data/rwf2000 --epochs 20
+Runs in a daemon background thread — does NOT block the main pipeline.
 
-Apache-2.0 alternative: torchvision.models.video (R3D-18, MC3-18, S3D, R2Plus1D-18).
-VideoMAE-base (CC-BY-NC) is NOT used to keep procurement-safe licensing.
+Install primary model:
+    pip install transformers
 """
 from __future__ import annotations
 
@@ -24,11 +19,18 @@ import queue
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable
 
 import numpy as np
 
 log = logging.getLogger("violence.clip")
+
+_VIDEOMAE_AVAILABLE = False
+try:
+    from transformers import VideoMAEForVideoClassification as _VideoMAEModel
+    _VIDEOMAE_AVAILABLE = True
+except ImportError:
+    pass
 
 _TORCH_VIDEO_AVAILABLE = False
 try:
@@ -38,33 +40,24 @@ try:
 except ImportError:
     pass
 
-# ── Kinetics-400 violence-related class names (R3D-18 / MC3-18 class index → label)
-# Loaded lazily from torchvision weights meta.
-_VIOLENCE_KEYWORDS = {
+VIDEOMAE_MODEL_ID = "OPear/videomae-large-finetuned-UCF-Crime"
+
+# Keywords to match against UCF-Crime label names → violence score
+_UCF_VIOLENCE_KEYWORDS = {"abuse", "assault", "fight", "robbery", "shooting"}
+
+# Keywords for R3D-18 Kinetics-400 fallback
+_K400_VIOLENCE_KEYWORDS = {
     "fight", "punch", "wrestl", "kick", "slap", "headbutt",
     "arm wrestling", "boxing", "karate", "judo", "sword", "shoot gun",
     "shove", "push", "throw", "hitting", "beating",
 }
 
 
-def _violence_class_indices(weights) -> list[int]:
-    """Return Kinetics-400 class indices whose names contain violence keywords."""
-    cats = weights.meta.get("categories", [])
-    idx = []
-    for i, name in enumerate(cats):
-        nl = name.lower()
-        if any(kw in nl for kw in _VIOLENCE_KEYWORDS):
-            idx.append(i)
-    return idx or list(range(10))   # fallback: first 10 classes (safety net)
-
-
-# ---------------------------------------------------------------------------
-
 @dataclass
 class ClipResult:
     score: float       # 0-1 violence probability
-    confirmed: bool    # True if score > threshold → stage-1 should escalate
-    label: str         # top matching Kinetics class name
+    confirmed: bool    # True if score > threshold
+    label: str         # top predicted class name
     camera_id: str
 
 
@@ -78,28 +71,25 @@ class ViolenceClipClassifier:
 
     BUFFER_LEN = 64     # frames kept in ring buffer (~4.3 s at 15 fps)
     CLIP_LEN = 16       # frames sampled per inference
-    CLIP_SIZE = 112     # spatial resize (R3D-18 expects 112×112)
 
     def __init__(
         self,
         device: str = "cpu",
         threshold: float = 0.55,
-        model_name: str = "r3d_18",
+        model_name: str = "videomae",
     ):
         self._device_str = device
         self._threshold = threshold
-        self._model_name = model_name
         self._model = None
+        self._backend = None    # "videomae" or "r3d18"
         self._violence_indices: list[int] = []
-        self._weights = None
+        self._id2label: dict[int, str] = {}
 
-        # Per-camera rolling frame buffers
         self._buffers: dict[str, deque] = {}
         self._buf_lock = threading.Lock()
 
-        # Inference queue: (camera_id, frames_snapshot, callback)
         self._queue: queue.Queue = queue.Queue(maxsize=8)
-        self._available = _TORCH_VIDEO_AVAILABLE
+        self._available = _VIDEOMAE_AVAILABLE or _TORCH_VIDEO_AVAILABLE
 
         if self._available:
             self._worker = threading.Thread(
@@ -108,8 +98,8 @@ class ViolenceClipClassifier:
             self._worker.start()
         else:
             log.warning(
-                "torchvision not available — clip classifier disabled. "
-                "Violence falls back to pose heuristics only."
+                "No video model backend available — clip classifier disabled. "
+                "Install: pip install transformers torch torchvision"
             )
 
     # ---------------------------------------------------------------- public
@@ -136,12 +126,12 @@ class ViolenceClipClassifier:
             frames_snapshot = list(buf) if buf else []
 
         if len(frames_snapshot) < 8:
-            return   # not enough frames yet
+            return
 
         try:
             self._queue.put_nowait((camera_id, frames_snapshot, callback))
         except queue.Full:
-            pass   # drop if worker is saturated
+            pass
 
     @property
     def available(self) -> bool:
@@ -158,50 +148,88 @@ class ViolenceClipClassifier:
             if (self._device_str == "cpu" or torch.cuda.is_available())
             else "cpu"
         )
-        try:
-            weights_enum = {
-                "r3d_18": _tv_video.R3D_18_Weights.KINETICS400_V1,
-                "mc3_18": _tv_video.MC3_18_Weights.KINETICS400_V1,
-                "r2plus1d_18": _tv_video.R2Plus1D_18_Weights.KINETICS400_V1,
-            }.get(self._model_name, _tv_video.R3D_18_Weights.KINETICS400_V1)
+        self._device = device
 
-            self._weights = weights_enum
-            model_fn = {
-                "r3d_18": _tv_video.r3d_18,
-                "mc3_18": _tv_video.mc3_18,
-                "r2plus1d_18": _tv_video.r2plus1d_18,
-            }.get(self._model_name, _tv_video.r3d_18)
+        # Primary: VideoMAE fine-tuned on UCF-Crime CCTV dataset
+        if _VIDEOMAE_AVAILABLE:
+            try:
+                from transformers import VideoMAEForVideoClassification
+                log.info(
+                    "Loading VideoMAE UCF-Crime model from HuggingFace (%s) — "
+                    "first run downloads ~1.2 GB...", VIDEOMAE_MODEL_ID
+                )
+                model = VideoMAEForVideoClassification.from_pretrained(VIDEOMAE_MODEL_ID)
+                model = model.eval().to(device)
+                self._model = model
+                self._backend = "videomae"
+                self._id2label = {int(k): v for k, v in model.config.id2label.items()}
+                self._violence_indices = [
+                    i for i, label in self._id2label.items()
+                    if any(kw in label.lower() for kw in _UCF_VIOLENCE_KEYWORDS)
+                ]
+                log.info(
+                    "VideoMAE UCF-Crime loaded on %s | violence classes: %s",
+                    device,
+                    [self._id2label[i] for i in self._violence_indices],
+                )
+                return
+            except Exception:
+                log.exception("VideoMAE load failed — falling back to R3D-18 Kinetics-400")
 
-            self._model = model_fn(weights=weights_enum)
-            self._model.eval().to(device)
-            self._device = device
-            self._violence_indices = _violence_class_indices(weights_enum)
-            log.info(
-                "Clip classifier: %s on %s | violence classes: %d",
-                self._model_name, device, len(self._violence_indices),
-            )
-        except Exception:
-            log.exception("Video model load failed — clip classifier disabled")
-            self._available = False
+        # Fallback: R3D-18 Kinetics-400
+        if _TORCH_VIDEO_AVAILABLE:
+            try:
+                weights = _tv_video.R3D_18_Weights.KINETICS400_V1
+                model = _tv_video.r3d_18(weights=weights).eval().to(device)
+                self._model = model
+                self._backend = "r3d18"
+                self._weights = weights
+                cats = weights.meta.get("categories", [])
+                self._id2label = {i: cats[i] for i in range(len(cats))}
+                self._violence_indices = [
+                    i for i, name in enumerate(cats)
+                    if any(kw in name.lower() for kw in _K400_VIOLENCE_KEYWORDS)
+                ] or list(range(10))
+                log.info(
+                    "R3D-18 Kinetics-400 loaded on %s (fallback) | violence classes: %d",
+                    device, len(self._violence_indices),
+                )
+            except Exception:
+                log.exception("R3D-18 load failed — classifier disabled")
+                self._available = False
 
     def _sample_clip(self, frames: list[np.ndarray]) -> "torch.Tensor":
-        """Sample CLIP_LEN evenly-spaced frames, resize, and convert to tensor."""
-        import torch
+        """Sample CLIP_LEN evenly-spaced frames, resize, normalise, return tensor."""
+        import torch, cv2
+
         n = len(frames)
         indices = [int(i * (n - 1) / (self.CLIP_LEN - 1)) for i in range(self.CLIP_LEN)]
-        import cv2
+
+        if self._backend == "videomae":
+            size = 224
+            mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+            std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        else:
+            size = 112
+            mean = np.array([0.43216, 0.394666, 0.37645], dtype=np.float32)
+            std  = np.array([0.22803, 0.22145, 0.216989], dtype=np.float32)
+
         clip = []
         for idx in indices:
-            f = cv2.resize(frames[idx], (self.CLIP_SIZE, self.CLIP_SIZE))
-            f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB)
+            f = cv2.resize(frames[idx], (size, size))
+            f = cv2.cvtColor(f, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            f = (f - mean) / std
             clip.append(f)
 
-        # (T, H, W, C) → (C, T, H, W) float32 normalised
-        arr = np.stack(clip, axis=0).astype(np.float32) / 255.0
-        mean = np.array([0.43216, 0.394666, 0.37645], dtype=np.float32)
-        std  = np.array([0.22803, 0.22145, 0.216989], dtype=np.float32)
-        arr = (arr - mean) / std
-        tensor = torch.from_numpy(arr).permute(3, 0, 1, 2).unsqueeze(0)  # (1,C,T,H,W)
+        arr = np.stack(clip, axis=0)  # (T, H, W, C)
+
+        if self._backend == "videomae":
+            # VideoMAE expects (batch, num_frames, channels, H, W)
+            tensor = torch.from_numpy(arr).permute(0, 3, 1, 2).unsqueeze(0)
+        else:
+            # R3D-18 expects (batch, C, T, H, W)
+            tensor = torch.from_numpy(arr).permute(3, 0, 1, 2).unsqueeze(0)
+
         return tensor.to(self._device)
 
     def _inference_loop(self) -> None:
@@ -217,17 +245,24 @@ class ViolenceClipClassifier:
                 import torch
                 clip = self._sample_clip(frames_snapshot)
                 with torch.no_grad():
-                    logits = self._model(clip)[0]
-                    probs = torch.softmax(logits, dim=0).cpu().numpy()
+                    if self._backend == "videomae":
+                        outputs = self._model(pixel_values=clip)
+                        probs = torch.softmax(outputs.logits[0], dim=0).cpu().numpy()
+                    else:
+                        logits = self._model(clip)[0]
+                        probs = torch.softmax(logits, dim=0).cpu().numpy()
 
-                if self._violence_indices:
-                    score = float(np.sum(probs[self._violence_indices]))
-                else:
-                    score = 0.0
-
+                score = (
+                    float(np.sum(probs[self._violence_indices]))
+                    if self._violence_indices else 0.0
+                )
                 top_idx = int(np.argmax(probs))
-                cats = self._weights.meta.get("categories", [])
-                top_label = cats[top_idx] if top_idx < len(cats) else str(top_idx)
+                top_label = self._id2label.get(top_idx, str(top_idx))
+
+                log.debug(
+                    "violence inference: backend=%s top=%s score=%.3f confirmed=%s",
+                    self._backend, top_label, score, score >= self._threshold,
+                )
 
                 result = ClipResult(
                     score=round(score, 3),

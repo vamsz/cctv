@@ -25,7 +25,7 @@ cameras:
   - id: CAM01
     name: Test Feed
     source: data/samples/test1.mp4
-    fps_cap: 15
+    fps_cap: 30
     stop_line: [[100, 600], [1820, 600]]      # placeholder
     signal_roi: [1500, 80, 1620, 280]          # placeholder
     direction: [0.0, -1.0]                      # placeholder: vehicles travel "up" the frame

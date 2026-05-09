@@ -22,3 +22,10 @@ data/debug_crops/
 data/*.key
 data/*.pub
 raw
+
+helmet-lincense-plate-detection.v10i.yolov8/
+RWF2000-Video-Database-for-Violence-Detection-master/
+Kaggle_Helmet/
+data/helmet_combined/
+data/plate_ft/
+A-Dataset-for-Automatic-Violence-Detection-in-Videos-master/

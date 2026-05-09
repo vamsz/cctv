@@ -27,7 +27,7 @@ helmet:
   helmet_conf: 0.40
 
 red_light:
-  enabled: true
+  enabled: false    # requires calibrated stop_line + signal_roi per camera
   # Signal must be RED for this many frames before checking crossings.
   red_debounce_frames: 5
   min_speed_px_per_frame: 1.5
@@ -41,7 +41,7 @@ plate_unreadable:
   min_plate_pixel_area: 800
 
 wrong_way:
-  enabled: true
+  enabled: false    # requires calibrated stop_line + direction per camera
   # Min frames driving against lawful direction before firing.
   min_frames_wrong_way: 10
   min_speed_px_per_frame: 2.0

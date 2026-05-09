@@ -22,8 +22,9 @@ transformers>=4.40.0
 # tokenizers is a transformers transitive dep but pinning avoids install issues
 tokenizers>=0.15.0
 
-# ── Violence Stage-2 clip classifier (R3D-18, Kinetics-400, Apache 2.0) ─────
-# torchvision already ships with ultralytics, but pin video models support:
+# ── Violence Stage-2 clip classifier ─────────────────────────────────────────
+# Primary: VideoMAE UCF-Crime (HuggingFace, via transformers — already above)
+# Fallback: torchvision R3D-18 Kinetics-400 (already ships with ultralytics)
 torchvision>=0.17.0
 
 # ── ReID store ───────────────────────────────────────────────────────────────

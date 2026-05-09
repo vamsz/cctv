@@ -43,7 +43,25 @@
       "Bash(python *)",
       "Bash(dir *.md)",
       "Bash(dir plan*.md)",
-      "Bash(dir PLAN*.md)"
+      "Bash(dir PLAN*.md)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.aicitychallenge.org)",
+      "WebSearch",
+      "WebFetch(domain:openaccess.thecvf.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:arxiv.org)",
+      "Bash(python3 -c \"import torch; print\\('CUDA:', torch.cuda.is_available\\(\\)\\); print\\('GPU:', torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else 'none'\\); print\\('VRAM:', round\\(torch.cuda.get_device_properties\\(0\\).total_memory/1e9,1\\), 'GB' if torch.cuda.is_available\\(\\) else ''\\)\")",
+      "Bash(grep -v \"^2026\\\\|oneDNN\\\\|RequestsDependency\\\\|warnings\\\\|^$\")",
+      "Bash(echo \"Training started in background. PID: $!\")",
+      "Bash(jobs -l)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\models\" -ErrorAction SilentlyContinue | Select-Object Name, @{N=\"MB\";E={[math]::Round\\($_.Length/1MB,1\\)}}, LastWriteTime)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\A-Dataset-for-Automatic-Violence-Detection-in-Videos-master\" -Recurse | Select-Object FullName, @{N=\"MB\";E={[math]::Round\\($_.Length/1MB,2\\)}} | Format-Table -AutoSize)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\A-Dataset-for-Automatic-Violence-Detection-in-Videos-master\" -Recurse | Where-Object {$_.Extension -eq \".mp4\"} | Select-Object -First 10 FullName)",
+      "PowerShell(Get-ChildItem \"C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\A-Dataset-for-Automatic-Violence-Detection-in-Videos-master\" -Recurse | Where-Object {-not $_.PSIsContainer} | Select-Object -First 20 FullName, @{N=\"Ext\";E={$_.Extension}})",
+      "PowerShell(Stop-Process *)",
+      "Bash(Remove-Item \"C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\scripts\\\\finetune_violence.py\" -Force)",
+      "Bash(Remove-Item \"C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\scripts\\\\prepare_violence_dataset.py\" -Force)",
+      "Bash(Remove-Item \"C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\models\\\\violence_r3d18_ft.pt\" -Force)"
     ]
   }
 }

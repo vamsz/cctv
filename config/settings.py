@@ -43,6 +43,7 @@ class Settings(BaseSettings):
 
     # weights
     detector_weights: Path = Field(default=ROOT / "models" / "yolo11n.pt")
+    # helmet_ft.pt (fine-tuned on 8k Indian+Kaggle images) takes priority when present
     helmet_weights: Path = Field(default=ROOT / "models" / "helmet.pt")
     plate_weights: Path = Field(default=ROOT / "models" / "plate.pt")
     pose_weights: str = "yolo11n-pose.pt"   # auto-downloads ~6MB; relative = ultralytics cache

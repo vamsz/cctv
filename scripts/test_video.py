@@ -1,4 +1,4 @@
-"""Quick test: run detection + tracking + OCR on a video file and show results.
+"""Quick test: run detection + tracking + OCR + violence detection on a video file.
 
 Usage:
     python scripts/test_video.py --video path/to/your_video.mp4
@@ -10,13 +10,13 @@ Controls:
     space pause/resume
     s     save current frame as screenshot
 
-This does NOT run the rules engine — it just shows you what the AI
-detects: vehicles, two-wheelers, helmets, plates, and OCR reads.
-Use this to verify detection accuracy before calibrating cameras.
+Supports any plate format: Indian, UK, EU, US, etc.
 """
 import argparse
 import sys
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -28,10 +28,11 @@ sys.path.insert(0, str(ROOT))
 from config.settings import settings
 from src.detection.classes import ObjectClass, VEHICLE_CLASSES
 from src.detection.detector import Detector
-from src.ocr.plate_normalize import normalize_indian_plate
+from src.ocr.plate_normalize import normalize_plate
 from src.ocr.plate_ocr import PlateOCR
-from src.tracking.tracker import Tracker, TrackedDetection
+from src.tracking.tracker import Tracker
 from src.rules.geometry import contains
+from src.violence.clip_classifier import ViolenceClipClassifier
 
 
 CLASS_COLORS = {
@@ -46,8 +47,12 @@ CLASS_COLORS = {
     ObjectClass.NO_HELMET: (0, 0, 255),
 }
 
+VIOLENCE_COLOR_OK   = (0, 220, 0)    # green — low score
+VIOLENCE_COLOR_MED  = (0, 165, 255)  # orange — medium
+VIOLENCE_COLOR_HIGH = (0, 0, 255)    # red — confirmed fight
 
-def draw(frame, tracked, plate_reads, bundle):
+
+def draw(frame, tracked, plate_reads, bundle, violence_score: float | None):
     for td in tracked:
         x1, y1, x2, y2 = (int(v) for v in td.detection.xyxy)
         cls = td.detection.cls
@@ -68,22 +73,53 @@ def draw(frame, tracked, plate_reads, bundle):
         x1, y1, x2, y2 = (int(v) for v in det.xyxy)
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
+    # Violence score bar (top-right corner)
+    if violence_score is not None:
+        H, W = frame.shape[:2]
+        bar_w, bar_h = 220, 28
+        bx = W - bar_w - 10
+        by = 10
+        pct = int(bar_w * min(violence_score, 1.0))
+        if violence_score >= 0.55:
+            col = VIOLENCE_COLOR_HIGH
+        elif violence_score >= 0.35:
+            col = VIOLENCE_COLOR_MED
+        else:
+            col = VIOLENCE_COLOR_OK
+        cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), (40, 40, 40), -1)
+        cv2.rectangle(frame, (bx, by), (bx + pct, by + bar_h), col, -1)
+        cv2.rectangle(frame, (bx, by), (bx + bar_w, by + bar_h), (255, 255, 255), 1)
+        tag = f"FIGHT {violence_score:.2f}" if violence_score >= 0.55 else f"Violence {violence_score:.2f}"
+        cv2.putText(frame, tag, (bx + 6, by + bar_h - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
     return frame
 
 
 def main():
     ap = argparse.ArgumentParser(description="Test CCTV detection on a video file")
     ap.add_argument("--video", required=True, help="Path to video file, RTSP URL, or webcam index (0)")
-    ap.add_argument("--save", default=None, help="Save annotated output to this path (e.g. output.mp4)")
+    ap.add_argument("--save", default=None, help="Save annotated output (e.g. output.mp4). Must differ from --video.")
     ap.add_argument("--device", default=None, help="Override device (cpu, cuda:0)")
     ap.add_argument("--conf", type=float, default=None, help="Override detection confidence threshold")
     ap.add_argument("--no-ocr", action="store_true", help="Skip OCR (faster)")
+    ap.add_argument("--no-violence", action="store_true", help="Skip violence detection")
     ap.add_argument("--no-display", action="store_true", help="Run headless (useful with --save)")
     ap.add_argument("--fast-ocr", action="store_true", help="Use 2 OCR passes instead of 6 (for CPU)")
-    ap.add_argument("--every-n", type=int, default=1, help="Process only every N-th frame (speeds up testing)")
-    ap.add_argument("--debug-crops", action="store_true", help="Save every plate crop + run details to data/debug_crops/")
+    ap.add_argument("--every-n", type=int, default=1, help="Process only every N-th frame")
+    ap.add_argument("--debug-crops", action="store_true", help="Save plate crops to data/debug_crops/")
     ap.add_argument("--max-frames", type=int, default=0, help="Stop after this many frames (0 = no limit)")
     args = ap.parse_args()
+
+    # Guard: don't overwrite the source file
+    if args.save and not args.video.isdigit():
+        src_path = Path(args.video).resolve()
+        dst_path = Path(args.save).resolve()
+        if src_path == dst_path:
+            print(f"ERROR: --save cannot be the same file as --video.\n"
+                  f"  Use a different output path, e.g.:\n"
+                  f"  --save data/samples/test_fight_out.mp4")
+            sys.exit(1)
 
     debug_dir = Path("data/debug_crops")
     if args.debug_crops:
@@ -105,11 +141,30 @@ def main():
 
     ocr = None
     if not args.no_ocr:
-        print("Loading EasyOCR...")
-        # Default to fast OCR on CPU (2 passes vs 6) — explicit flag overrides
+        print("Loading OCR...")
         fast = args.fast_ocr or device == "cpu"
         ocr = PlateOCR(lang=settings.ocr_lang, use_gpu=device.startswith("cuda"), fast_mode=fast)
         print(f"  OCR mode: {'fast (2 passes)' if fast else 'accurate (6 passes)'}")
+
+    violence_clf = None
+    latest_violence: dict = {"score": None, "label": ""}
+    v_lock = threading.Lock()
+
+    if not args.no_violence:
+        print("Loading violence classifier...")
+        violence_clf = ViolenceClipClassifier(device=device, threshold=0.55)
+        if violence_clf.available:
+            print("  Violence classifier ready")
+        else:
+            print("  Violence classifier unavailable (torchvision not installed)")
+            violence_clf = None
+
+    def _on_violence_result(result):
+        with v_lock:
+            latest_violence["score"] = result.score
+            latest_violence["label"] = result.label
+        tag = "FIGHT CONFIRMED" if result.confirmed else "non-fight"
+        print(f"  [Violence] score={result.score:.3f} ({tag}) label={result.label}")
 
     tracker = Tracker(frame_rate=15)
     plate_reads: dict[int, tuple[str, float]] = {}
@@ -136,6 +191,8 @@ def main():
     paused = False
     t_start = time.time()
     det_count = 0
+    # Request violence inference every N frames once buffer has enough data
+    _VIOLENCE_INTERVAL = 16
 
     print("\nRunning... (press 'q' to quit, 'space' to pause)\n")
 
@@ -150,7 +207,6 @@ def main():
                 print(f"\nReached --max-frames {args.max_frames}")
                 break
 
-            # Skip frames for speed
             if args.every_n > 1 and frame_idx % args.every_n != 0:
                 if writer:
                     writer.write(frame)
@@ -161,10 +217,22 @@ def main():
             tracked = tracker.update(bundle)
             n_plates = len(bundle.of(ObjectClass.LICENSE_PLATE))
 
+            # Violence: feed every frame; request inference periodically
+            if violence_clf is not None:
+                violence_clf.submit_frame("test", frame)
+                if frame_idx % _VIOLENCE_INTERVAL == 0:
+                    violence_clf.request_inference("test", _on_violence_result)
+
             elapsed = time.time() - t_start
             proc_fps = frame_idx / elapsed if elapsed > 0 else 0
             progress = f"{frame_idx}/{total_frames}" if total_frames > 0 else str(frame_idx)
-            print(f"[{progress}] {proc_fps:.1f} fps | {len(tracked)} tracked | {n_plates} plates detected | {det_count} read", flush=True)
+
+            with v_lock:
+                vscore = latest_violence["score"]
+
+            print(f"[{progress}] {proc_fps:.1f} fps | {len(tracked)} tracked | "
+                  f"{n_plates} plates detected | {det_count} read"
+                  + (f" | violence={vscore:.2f}" if vscore is not None else ""), flush=True)
 
             plate_dets = bundle.of(ObjectClass.LICENSE_PLATE)
             for td in tracked:
@@ -177,29 +245,40 @@ def main():
                         if ocr:
                             x1, y1, x2, y2 = (max(0, int(v)) for v in p.xyxy)
                             crop = frame[y1:y2, x1:x2].copy()
-                            if crop.size > 0:
-                                ch, cw = crop.shape[:2]
-                                read = ocr.read(crop)
-                                raw = read.text if read else None
-                                conf = read.confidence if read else 0.0
-                                normalized = normalize_indian_plate(raw) if raw else None
-                                display = normalized or raw or "(no text)"
-                                if read and read.text:
-                                    plate_reads[td.track_id] = (display, conf)
-                                    det_count += 1
-                                print(f"  PLATE Track#{td.track_id} crop={cw}x{ch} det_conf={p.conf:.2f} -> raw='{raw or '(empty)'}' normalized='{normalized or '-'}' ocr_conf={conf:.2f}", flush=True)
-                                if args.debug_crops:
-                                    label = (raw or "empty").replace("/", "_").replace(":", "_")[:20]
-                                    cv2.imwrite(str(debug_dir / f"f{frame_idx:04d}_t{td.track_id}_{label}.jpg"), crop)
+                            if crop.size == 0:
+                                break
+                            ch, cw = crop.shape[:2]
+                            # Skip crops that don't have plate-like aspect ratio
+                            if ch > 0 and cw / ch < 1.4:
+                                print(f"  PLATE Track#{td.track_id} crop={cw}x{ch} "
+                                      f"det_conf={p.conf:.2f} -> skipped (not plate shape)", flush=True)
+                                break
+                            read = ocr.read(crop)
+                            raw = read.text if read else None
+                            conf_val = read.confidence if read else 0.0
+                            normalized = normalize_plate(raw) if raw else None
+                            display = normalized or raw or "(no text)"
+                            if read and read.text:
+                                plate_reads[td.track_id] = (display, conf_val)
+                                det_count += 1
+                            print(f"  PLATE Track#{td.track_id} crop={cw}x{ch} "
+                                  f"det_conf={p.conf:.2f} -> raw='{raw or '(empty)'}' "
+                                  f"normalized='{normalized or '-'}' ocr_conf={conf_val:.2f}", flush=True)
+                            if args.debug_crops:
+                                label = (raw or "empty").replace("/", "_").replace(":", "_")[:20]
+                                cv2.imwrite(str(debug_dir / f"f{frame_idx:04d}_t{td.track_id}_{label}.jpg"), crop)
                         break
 
-            annotated = draw(frame.copy(), tracked, plate_reads, bundle)
+            with v_lock:
+                vscore = latest_violence["score"]
+
+            annotated = draw(frame.copy(), tracked, plate_reads, bundle, vscore)
 
             elapsed = time.time() - t_start
             proc_fps = frame_idx / elapsed if elapsed > 0 else 0
-            progress = f"{frame_idx}/{total_frames}" if total_frames > 0 else str(frame_idx)
-            info = f"Frame {progress} | {proc_fps:.1f} fps | {len(tracked)} tracked | {det_count} plates read"
-            cv2.putText(annotated, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            info = (f"Frame {frame_idx}/{total_frames} | {proc_fps:.1f} fps | "
+                    f"{len(tracked)} tracked | {det_count} plates read")
+            cv2.putText(annotated, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
 
             if writer:
                 writer.write(annotated)
@@ -232,8 +311,13 @@ def main():
     print(f"  Plates read: {det_count}")
     if plate_reads:
         print(f"  Plate texts:")
-        for tid, (text, conf) in sorted(plate_reads.items()):
-            print(f"    Track #{tid}: {text} (confidence: {conf:.2f})")
+        for tid, (text, conf_v) in sorted(plate_reads.items()):
+            print(f"    Track #{tid}: {text} (confidence: {conf_v:.2f})")
+    with v_lock:
+        vscore = latest_violence["score"]
+        vlabel = latest_violence["label"]
+    if vscore is not None:
+        print(f"  Final violence score: {vscore:.3f} (last label: {vlabel})")
 
 
 if __name__ == "__main__":

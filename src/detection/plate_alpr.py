@@ -82,32 +82,71 @@ class ALPRDetector:
     def available(self) -> bool:
         return self._available and self._alpr is not None
 
+    # fast-alpr ONNX model is calibrated at ~640px — downscale large frames
+    _MAX_DIM = 1280
+
     def detect(
         self,
         frame: np.ndarray,
     ) -> list[tuple[tuple[float, float, float, float], Optional[str], float]]:
         """
         Returns list of (xyxy_pixels, text_or_None, confidence).
+        Downscales frames wider than _MAX_DIM so the ONNX model gets a
+        sensible resolution; coordinates are rescaled back to original frame.
         Returns empty list when fast-alpr is unavailable.
         """
         if not self.available or self._alpr is None:
             return []
+
+        h, w = frame.shape[:2]
+        scale = 1.0
+        if w > self._MAX_DIM:
+            scale = self._MAX_DIM / w
+            import cv2 as _cv2
+            new_w = self._MAX_DIM
+            new_h = int(h * scale)
+            infer_frame = _cv2.resize(frame, (new_w, new_h), interpolation=_cv2.INTER_LINEAR)
+        else:
+            infer_frame = frame
+
         try:
-            results = self._alpr.predict(frame)
+            results = self._alpr.predict(infer_frame)
             out = []
             for r in results:
                 try:
                     xyxy = _bbox_to_xyxy(r.detection.bounding_box)
+                    # Rescale back to original frame coordinates
+                    if scale != 1.0:
+                        xyxy = (
+                            xyxy[0] / scale, xyxy[1] / scale,
+                            xyxy[2] / scale, xyxy[3] / scale,
+                        )
                     det_conf = float(r.detection.confidence)
                     text = None
                     text_conf = det_conf
                     if r.ocr is not None:
-                        text = str(r.ocr.text).strip().upper().replace(" ", "")
-                        text_conf = float(r.ocr.confidence)
+                        raw_text = r.ocr.text
+                        raw_conf = r.ocr.confidence
+                        # text may be a list of strings per character
+                        if isinstance(raw_text, (list, tuple)):
+                            text = "".join(str(t) for t in raw_text).strip().upper().replace(" ", "")
+                        else:
+                            text = str(raw_text).strip().upper().replace(" ", "")
+                        # confidence may be a list of per-character floats
+                        if isinstance(raw_conf, (list, tuple)):
+                            text_conf = float(sum(raw_conf) / len(raw_conf)) if raw_conf else det_conf
+                        else:
+                            text_conf = float(raw_conf)
+                    # Discard near-square / portrait detections — not a real plate
+                    bw = xyxy[2] - xyxy[0]
+                    bh = xyxy[3] - xyxy[1]
+                    if bh > 0 and bw / bh < 1.4:
+                        log.debug("fast-alpr: skipping non-plate aspect ratio %.2f", bw / bh)
+                        continue
                     out.append((xyxy, text, text_conf))
                 except Exception:
-                    pass
+                    log.warning("fast-alpr result parse error", exc_info=True)
             return out
         except Exception:
-            log.debug("fast-alpr inference failed", exc_info=True)
+            log.warning("fast-alpr inference failed on frame %dx%d", w, h, exc_info=True)
             return []

@@ -290,33 +290,35 @@ class CameraPipeline:
 
     def _loop(self) -> None:
         last_frame_idx = -1
-        _live_frame_counter = 0
+        _drop_warn_accumulator = 0
         from src.common.metrics import frames_total, frame_drops_total
         while not self._stop.is_set():
             packet = self.reader.read()
             if packet is None:
-                time.sleep(0.01)
+                time.sleep(0.005)
                 continue
             frame_idx, ts, frame = packet
             if frame_idx == last_frame_idx:
-                time.sleep(0.005)
+                time.sleep(0.002)
                 continue
 
-            # Frame-skip governor: if we're more than 3 frames behind, skip
-            # inference to catch up but still update the live frame buffer.
             skip_count = frame_idx - last_frame_idx - 1
             if skip_count > 0:
                 frame_drops_total.labels(camera_id=self.spec.id).inc(skip_count)
-                if skip_count > 3:
-                    log.warning("[%s] dropped %d frames (inference slower than capture)", self.spec.id, skip_count)
+                _drop_warn_accumulator += skip_count
+                # Only warn once per 60-frame burst to avoid log spam
+                if _drop_warn_accumulator >= 60:
+                    log.warning("[%s] inference lagging — dropped %d frames in last burst", self.spec.id, _drop_warn_accumulator)
+                    _drop_warn_accumulator = 0
+            else:
+                _drop_warn_accumulator = 0
 
             last_frame_idx = frame_idx
             frames_total.labels(camera_id=self.spec.id).inc()
 
-            # Update MJPEG buffer every 3 frames (~5fps at 15fps cap) — fast, low cost
-            _live_frame_counter += 1
-            if _live_frame_counter % 3 == 0:
-                update_live_frame(self.spec.id, frame)
+            # Push every raw frame to MJPEG buffer immediately so the UI stays live.
+            # _annotate_crowd_on_live_frame will overwrite with overlays once available.
+            update_live_frame(self.spec.id, frame)
 
             try:
                 self._process_frame(frame_idx, ts, frame)
@@ -861,6 +863,20 @@ def _crop(frame: np.ndarray, xyxy: tuple[float, float, float, float]) -> np.ndar
 
 class PipelineOrchestrator:
     def __init__(self):
+        import os
+        import torch
+        # Use all available CPU threads for data-parallel operations (OCR, pre/post-process).
+        cpu_count = os.cpu_count() or 4
+        torch.set_num_threads(cpu_count)
+        torch.set_num_interop_threads(max(2, cpu_count // 2))
+        log.info("CPU parallelism: %d inference threads, %d interop threads", cpu_count, max(2, cpu_count // 2))
+
+        if torch.cuda.is_available():
+            # Allow PyTorch to overlap CPU↔GPU transfers with compute
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            log.info("CUDA: %s | TF32+cuDNN benchmark enabled", torch.cuda.get_device_name(0))
+
         from src.common.db import engine
         from src.evidence.models import Base
         Base.metadata.create_all(bind=engine())
