@@ -29,7 +29,7 @@ cameras:
     stop_line: [[100, 600], [1820, 600]]      # placeholder
     signal_roi: [1500, 80, 1620, 280]          # placeholder
     direction: [0.0, -1.0]                      # placeholder: vehicles travel "up" the frame
-    enabled: true
+    enabled: false
 
   - id: SAMPLE
     name: "Local sample video for offline test"

@@ -30,6 +30,48 @@ from .plate_alpr import ALPRDetector
 log = logging.getLogger("detection.detector")
 
 
+def _iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    ua = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    ub = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = ua + ub - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _dedupe_plates(plates, iou_thresh: float = 0.4):
+    """Merge overlapping plate detections from multiple detectors.
+
+    When two boxes overlap above the threshold we keep the one with
+    text (fast-alpr's bundled OCR run) over the bare bbox detection.
+    Otherwise highest confidence wins.
+    """
+    kept = []
+    for det in plates:
+        # find an overlapping kept detection
+        merged = False
+        for i, k in enumerate(kept):
+            if _iou(det.xyxy, k.xyxy) >= iou_thresh:
+                # one with text wins; otherwise higher confidence wins
+                if det.text and not k.text:
+                    kept[i] = det
+                elif k.text and not det.text:
+                    pass
+                elif det.conf > k.conf:
+                    kept[i] = det
+                merged = True
+                break
+        if not merged:
+            kept.append(det)
+    return kept
+
+
 @dataclass
 class Detection:
     cls: ObjectClass
@@ -81,6 +123,7 @@ class Detector:
         self.use_sahi_plate = use_sahi_plate
         self._half = device.startswith("cuda")  # fp16 — CUDA only, ~1.5-2x faster
         self.general = YOLO(str(general_weights))
+        self._warmup(self.general, "general")
 
         self.helmet = None
         if helmet_weights and Path(helmet_weights).exists():
@@ -89,28 +132,55 @@ class Detector:
             if ft.exists():
                 helmet_weights = ft
             self.helmet = YOLO(str(helmet_weights))
+            self._warmup(self.helmet, "helmet")
             log.info("Helmet model: %s", Path(helmet_weights).name)
 
-        # fast-alpr: try first; if unavailable, fall back to plate.pt
+        # fast-alpr (global) detector — kept available for foreign plates,
+        # not just gated behind use_fast_alpr=True. We always run BOTH
+        # detectors when both exist so that:
+        #   - plate_ft.pt catches Indian plates well
+        #   - fast-alpr catches everything else (EU / NA / etc.)
+        # and we IoU-dedupe at the end.
         self._alpr: Optional[ALPRDetector] = None
         if use_fast_alpr:
             alpr = ALPRDetector(device=device, conf=conf)
             if alpr.available:
                 self._alpr = alpr
+                log.info("Plate detector: fast-alpr (global)")
 
+        # plate.pt / plate_ft.pt — fine-tuned domain detector
         self.plate = None
-        if self._alpr is None:
-            # Only load plate.pt when fast-alpr is not available
-            if plate_weights and Path(plate_weights).exists():
-                # Auto-upgrade: prefer plate_ft.pt (fine-tuned) over plate.pt
-                pt_ft = Path(plate_weights).parent / "plate_ft.pt"
-                if pt_ft.exists():
-                    plate_weights = pt_ft
-                self.plate = YOLO(str(plate_weights))
-                log.info("Plate model: %s", Path(plate_weights).name)
+        if plate_weights and Path(plate_weights).exists():
+            pt_ft = Path(plate_weights).parent / "plate_ft.pt"
+            if pt_ft.exists():
+                plate_weights = pt_ft
+            self.plate = YOLO(str(plate_weights))
+            self._warmup(self.plate, "plate")
+            log.info("Plate detector: %s", Path(plate_weights).name)
+
+        # Make sure we have *some* plate detector
+        if self.plate is None and self._alpr is None and not use_fast_alpr:
+            # last resort: spin up fast-alpr even if user disabled it
+            alpr = ALPRDetector(device=device, conf=conf)
+            if alpr.available:
+                self._alpr = alpr
+                log.info("Plate detector fallback: fast-alpr (global)")
 
         if self.use_sahi_plate and self.plate is None and self._alpr is None:
             self.use_sahi_plate = False
+
+    def _warmup(self, model: YOLO, name: str) -> None:
+        """Run a single dummy predict so model weights are fully materialized
+        on the target device. With torch >= 2.5 + ultralytics 8.3.x, plain
+        ``model.to(device)`` leaves params on a meta tensor — the first real
+        predict (especially batched / with half=True) then crashes inside
+        ``model.fuse()``. Warming up here avoids that completely.
+        """
+        try:
+            dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+            model.predict(dummy, device=self.device, verbose=False, half=self._half)
+        except Exception:
+            log.exception("YOLO warmup failed for %s — first real predict may crash", name)
 
     def _parse_helmet_results(self, res) -> list[Detection]:
         names = res.names
@@ -210,39 +280,37 @@ class Detector:
                 # No riders detected — fall back to full-frame pass
                 bundle.detections.extend(self._helmet_full_frame(frame))
 
-        # --- plate head: fast-alpr (preferred) or legacy plate.pt ---
+        # --- plate head: run BOTH detectors when available, IoU-dedupe ---
+        plate_dets: list[Detection] = []
+
         if self._alpr is not None:
             for xyxy_box, text, text_c in self._alpr.detect(frame):
-                bundle.detections.append(
-                    Detection(
+                plate_dets.append(Detection(
+                    cls=ObjectClass.LICENSE_PLATE,
+                    conf=text_c,
+                    xyxy=xyxy_box,
+                    text=text,
+                    text_conf=text_c if text else None,
+                ))
+
+        if self.plate is not None:
+            res = self.plate.predict(
+                frame, device=self.device, conf=self.conf,
+                verbose=False, half=self._half,
+            )[0]
+            if res.boxes is not None and len(res.boxes) > 0:
+                xyxy = res.boxes.xyxy.cpu().numpy()
+                confs = res.boxes.conf.cpu().numpy()
+                for box, c in zip(xyxy, confs):
+                    plate_dets.append(Detection(
                         cls=ObjectClass.LICENSE_PLATE,
-                        conf=text_c,
-                        xyxy=xyxy_box,
-                        text=text,
-                        text_conf=text_c if text else None,
-                    )
-                )
-        elif self.plate is not None:
-            if self.use_sahi_plate:
-                from .plate_sahi import detect_plates_sliced
-                for xyxy_box, c in detect_plates_sliced(
-                    frame, self.plate, self.device, self.conf
-                ):
-                    bundle.detections.append(
-                        Detection(cls=ObjectClass.LICENSE_PLATE, conf=c, xyxy=xyxy_box)
-                    )
-            else:
-                res = self.plate.predict(frame, device=self.device, conf=self.conf, verbose=False, half=self._half)[0]
-                if res.boxes is not None and len(res.boxes) > 0:
-                    xyxy = res.boxes.xyxy.cpu().numpy()
-                    confs = res.boxes.conf.cpu().numpy()
-                    for box, c in zip(xyxy, confs):
-                        bundle.detections.append(
-                            Detection(
-                                cls=ObjectClass.LICENSE_PLATE,
-                                conf=float(c),
-                                xyxy=tuple(map(float, box)),
-                            )
-                        )
+                        conf=float(c),
+                        xyxy=tuple(map(float, box)),
+                    ))
+
+        # IoU-dedupe overlapping plate detections from the two detectors.
+        # When both fired on the same plate we prefer the fast-alpr one
+        # because it carries the bundled OCR text already.
+        bundle.detections.extend(_dedupe_plates(plate_dets, iou_thresh=0.4))
 
         return bundle

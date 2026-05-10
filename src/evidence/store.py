@@ -109,6 +109,23 @@ class EvidenceStore:
         violations_total.labels(camera_id=event.camera_id, code=event.code.value).inc()
         return row_id
 
+    def save_face_crop(self, camera_id: str, crop: np.ndarray) -> str:
+        """Persist a face crop captured during a violence incident."""
+        ts = datetime.utcnow()
+        key = f"faces/{ts.strftime('%Y-%m-%d')}/{camera_id}_{ts.strftime('%H%M%S%f')}.jpg"
+        self.objects.put_bytes(key, self._encode(crop, 92), "image/jpeg")
+        return key
+
+    def save_plate_crop(self, plate_text: str, crop: np.ndarray) -> str:
+        """Persist a plate crop for the surveillance log. Returns the
+        object-store key (relative path under EVIDENCE_DIR / S3 prefix).
+        """
+        ts = datetime.utcnow()
+        safe_plate = "".join(c for c in plate_text if c.isalnum()) or "UNKNOWN"
+        key = f"plates/{ts.strftime('%Y-%m-%d')}/{ts.strftime('%H%M%S%f')}_{safe_plate}.jpg"
+        self.objects.put_bytes(key, self._encode(crop, 90), "image/jpeg")
+        return key
+
     # --------------------------------------------------------------- camera health
 
     def heartbeat(self, camera_id: str, last_frame_at: datetime, fps_observed: float, is_up: bool, error: str | None = None) -> None:

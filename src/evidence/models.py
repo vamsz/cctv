@@ -177,6 +177,69 @@ class Incident(Base):
     )
 
 
+class PlateSighting(Base):
+    """Surveillance plate log — every plate seen on every camera, every time.
+
+    The mass-surveillance backbone: cross-camera matching, suspect tracking,
+    and historic lookups all read from this table. Write rate is one row per
+    unique (camera_id, track_id, plate_text) triple — no per-frame spam.
+    """
+    __tablename__ = "plate_sightings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plate_text = Column(String(32), index=True, nullable=False)
+    camera_id = Column(String(64), index=True, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True, nullable=False)
+    track_id = Column(Integer, nullable=True)
+    global_id = Column(String(36), nullable=True, index=True)   # ReID global id if assigned
+    ocr_confidence = Column(Float, nullable=False, default=0.0)
+    vehicle_class = Column(String(32), nullable=True)            # car | two_wheeler | bus | truck
+    vehicle_color = Column(String(32), nullable=True)
+    plate_crop_path = Column(String(512), nullable=True)         # cropped plate image
+    is_cross_camera_match = Column(Boolean, nullable=False, default=False, index=True)
+
+    __table_args__ = (
+        Index("ix_plate_sightings_plate_ts", "plate_text", "timestamp"),
+        Index("ix_plate_sightings_camera_ts", "camera_id", "timestamp"),
+        # Fast lookup for the per-track UPDATE path (every plate read
+        # does s.get(PlateSighting, existing_id) — that's already O(1)
+        # by primary key, but the per-track ordering query in the
+        # face-capture replace path is hit hardest):
+        Index("ix_plate_sightings_camera_track", "camera_id", "track_id"),
+    )
+
+
+class FaceCapture(Base):
+    """Face captured during a violence incident.
+
+    Stored with a 384-d DINOv2 embedding so the police-DB matcher can do
+    a cosine-similarity lookup; the matched record id + similarity are
+    stamped on this row when a hit is found.
+    """
+    __tablename__ = "face_captures"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    incident_id = Column(Integer, nullable=True, index=True)
+    camera_id = Column(String(64), index=True, nullable=False)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True, nullable=False)
+    track_id = Column(Integer, nullable=True)
+    face_crop_path = Column(String(512), nullable=False)
+    embedding = Column(LargeBinary, nullable=True)              # 384-d float32 .tobytes()
+    quality_score = Column(Float, nullable=False, default=0.0)  # crop confidence / sharpness
+
+    # Mock police-DB match (replace with real provider in production)
+    matched_record_id = Column(String(64), nullable=True, index=True)
+    matched_name = Column(String(255), nullable=True)
+    matched_charges = Column(Text, nullable=True)
+    matched_risk_level = Column(String(16), nullable=True)
+    match_similarity = Column(Float, nullable=True)
+
+    __table_args__ = (
+        Index("ix_face_captures_incident", "incident_id"),
+        Index("ix_face_captures_match", "matched_record_id"),
+    )
+
+
 class CrowdSnapshot(Base):
     """Point-in-time crowd density snapshot — written on warning/critical or every N frames."""
     __tablename__ = "crowd_snapshots"

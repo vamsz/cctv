@@ -44,6 +44,26 @@ def annotate(
     for d in bundle.detections:
         x1, y1, x2, y2 = map(int, d.xyxy)
         color = CLASS_COLOR.get(d.cls, (200, 200, 200))
+
+        # Plates get extra-prominent treatment: thicker box + OCR text
+        if d.cls == ObjectClass.LICENSE_PLATE:
+            cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+            if d.text:
+                # Draw a filled background strip ABOVE the plate with the OCR text
+                label = d.text.strip()
+                conf = d.text_conf if d.text_conf is not None else d.conf
+                strip = f"{label}  {conf*100:.0f}%"
+                (tw, th), _ = cv2.getTextSize(strip, cv2.FONT_HERSHEY_DUPLEX, 0.6, 2)
+                bx1, by1 = x1, max(0, y1 - th - 8)
+                bx2, by2 = min(out.shape[1], x1 + tw + 12), y1
+                cv2.rectangle(out, (bx1, by1), (bx2, by2), (0, 165, 255), -1)
+                cv2.putText(out, strip, (bx1 + 6, by2 - 6),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.6, (10, 10, 10), 2, cv2.LINE_AA)
+            else:
+                cv2.putText(out, f"plate {d.conf:.2f}", (x1, max(0, y1 - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+            continue
+
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 1)
         cv2.putText(out, f"{d.cls.value} {d.conf:.2f}", (x1, max(0, y1 - 5)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)

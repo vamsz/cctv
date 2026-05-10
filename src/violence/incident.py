@@ -85,3 +85,9 @@ class IncidentManager:
     @property
     def current(self) -> Optional[ViolenceIncident]:
         return self._inc
+
+    def is_active(self) -> bool:
+        return self._inc is not None and self._inc.status in ("suspected", "active")
+
+    def current_db_id(self) -> Optional[int]:
+        return self._inc.db_id if self._inc is not None else None

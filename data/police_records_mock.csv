@@ -1,0 +1,13 @@
+record_id,name,age,gender,charges,risk_level,last_known_address,notes
+PR-1001,Ravi Kumar Reddy,34,M,"Robbery, Assault",high,"Hyderabad, Banjara Hills","Wanted in 2 cases, last seen 2025-11-12"
+PR-1002,Suresh Naidu,29,M,Chain snatching,medium,"Vijayawada, Patamata",Habitual offender — 3 prior arrests
+PR-1003,Pradeep Goud,41,M,"Vehicle theft, Mugging",high,"Hyderabad, LB Nagar",Operates with 2 known accomplices
+PR-1004,Anil Verma,37,M,Burglary,medium,"Secunderabad, Trimulgherry",
+PR-1005,Kiran Yadav,26,M,Pickpocketing,low,"Hyderabad, Charminar",Petty theft repeat offender
+PR-1006,Mahesh Babu Singh,45,M,"Assault, Public nuisance",medium,"Warangal, Hanamkonda",
+PR-1007,Ramesh Choudhary,31,M,Drug trafficking,critical,"Vizag, Dwaraka Nagar",Inter-state operative — DO NOT APPROACH ALONE
+PR-1008,Vinod Kumar,28,M,"Theft, Trespassing",low,"Hyderabad, Kukatpally",
+PR-1009,Sandeep Rao,33,M,"Extortion, Threatening",high,"Vijayawada, Governorpet",Linked to local protection ring
+PR-1010,Deepak Sharma,39,M,Murder (cold case),critical,"Hyderabad, Ameerpet",Fled jurisdiction in 2023 — high priority
+PR-1011,Manoj Tiwari,25,M,Rioting,medium,Karimnagar,
+PR-1012,Lakshmi Priya,30,F,"Cybercrime, Fraud",medium,"Hyderabad, Madhapur",Online romance scam ring

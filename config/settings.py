@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     ocr_lang: str = "en"
 
     # fast-alpr / fast-plate-ocr settings (Tier-1 upgrade)
+    # Enabled: Detector now runs BOTH fast-alpr (global) AND plate_ft.pt
+    # (fine-tuned Indian) and IoU-merges their bboxes. Indian plates are
+    # caught by plate_ft, foreign plates by fast-alpr — neither is missed.
     use_fast_alpr: bool = True
     fast_alpr_detector: str = "yolo-v9-t-384-license-plate-end2end"
     fast_alpr_ocr_model: str = "global-plates-mobile-vit-v2-model"
@@ -64,7 +67,7 @@ class Settings(BaseSettings):
     device: str = ""
     max_fps: int = 15
     det_conf: float = 0.35
-    ocr_auto_accept: float = 0.80
+    ocr_auto_accept: float = 0.45
 
     # auth
     jwt_secret: SecretStr = SecretStr("dev-only-not-for-production")
@@ -102,6 +105,11 @@ class Settings(BaseSettings):
     reid_threshold: float = 0.70         # DINOv2-Small: 0.70; MobileNetV3 fallback: 0.85
     reid_max_age_seconds: float = 300.0  # how long to keep embeddings in memory
     reid_extract_every_n: int = 15       # extract embedding every N frames per track
+
+    # face capture for violence incidents
+    police_match_threshold: float = 0.55         # cosine similarity for "match"
+    face_capture_every_n_frames: int = 15        # 1 face capture pass per ~0.5s at 30fps
+    face_capture_max_per_incident: int = 8       # cap to avoid overwhelming the operator
 
     # plate detection
     sahi_plate_enabled: bool = False     # sliced plate inference (adds ~10ms per frame)

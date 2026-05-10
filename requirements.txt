@@ -10,10 +10,13 @@ fast-plate-ocr>=0.3.0
 fast-alpr>=0.2.0
 # ONNX runtime — required by fast-plate-ocr and fast-alpr
 onnxruntime>=1.18.0
-# Priority 3: PaddleOCR >= 3.0.3 (Windows MKLDNN fix confirmed in changelog)
-# Uncomment when you want the PaddleOCR fallback:
-# paddleocr>=3.0.3
-# paddlepaddle>=3.0.0
+# Priority 2: PaddleOCR PP-OCRv5 (Apache 2.0, May 2025) — +13% accuracy
+# over PP-OCRv4. Runs as a co-equal second engine with fast-plate-ocr;
+# the consensus of both is what gets persisted, not just one engine.
+# enable_mkldnn=False is set in code to dodge the Windows PIR-attribute
+# bug in Paddle 3.3 + PP-OCRv5.
+paddleocr>=3.0.3
+paddlepaddle>=3.0.0
 # Priority 4 (legacy fallback, always installed):
 easyocr==1.7.2
 
@@ -24,8 +27,12 @@ tokenizers>=0.15.0
 
 # ── Violence Stage-2 clip classifier ─────────────────────────────────────────
 # Primary: VideoMAE UCF-Crime (HuggingFace, via transformers — already above)
+# Per-frame: jaranohaal/vit-base-violence-detection — loaded via timm because
+#   the checkpoint uses timm-style key naming, not HF AutoModel naming.
 # Fallback: torchvision R3D-18 Kinetics-400 (already ships with ultralytics)
 torchvision>=0.17.0
+timm>=1.0.0
+safetensors>=0.4.0
 
 # ── ReID store ───────────────────────────────────────────────────────────────
 faiss-cpu

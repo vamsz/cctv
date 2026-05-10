@@ -53,7 +53,7 @@ from src.common.logging import configure_logging, get_logger
 from src.common.metrics import review_action_total, review_backlog, start_metrics_server
 from src.common.object_store import get_object_store
 from src.common.security import hash_password, issue_jwt, verify_password, JWTError, verify_jwt
-from src.evidence.models import Base, CameraHealth, Incident, User, Violation, WatchlistEntry
+from src.evidence.models import Base, CameraHealth, FaceCapture, Incident, PlateSighting, User, Violation, WatchlistEntry
 from src.evidence.store import ReviewStatus
 from src.rules import watchlist as wl
 
@@ -217,6 +217,179 @@ def login(body: LoginIn, request: Request):
         s.flush()
         token = issue_jwt(user.email, user.role, {"name": user.full_name})
         return TokenOut(access_token=token, role=user.role, full_name=user.full_name)
+
+
+# ----------------------------------------------------------------- face captures (surveillance)
+
+
+def _face_to_dict(r: FaceCapture) -> dict:
+    return {
+        "id": r.id,
+        "incident_id": r.incident_id,
+        "camera_id": r.camera_id,
+        "timestamp": r.timestamp.isoformat() + "Z",
+        "track_id": r.track_id,
+        "face_crop_path": r.face_crop_path,
+        "quality_score": round(r.quality_score, 2),
+        "matched_record_id": r.matched_record_id,
+        "matched_name": r.matched_name,
+        "matched_charges": r.matched_charges,
+        "matched_risk_level": r.matched_risk_level,
+        "match_similarity": round(r.match_similarity, 3) if r.match_similarity is not None else None,
+    }
+
+
+@app.get("/api/faces")
+def list_faces(
+    incident_id: Optional[int] = None,
+    camera_id: Optional[str] = None,
+    matched_only: bool = False,
+    risk_level: Optional[str] = Query(default=None, pattern="^(low|medium|high|critical)$"),
+    since: Optional[datetime] = None,
+    limit: int = Query(default=100, le=500),
+    offset: int = 0,
+    _: None = Depends(rate_limit),
+):
+    """Surveillance log of every face captured during a violence incident."""
+    with session_scope() as s:
+        stmt = select(FaceCapture).order_by(FaceCapture.timestamp.desc())
+        if incident_id is not None:
+            stmt = stmt.where(FaceCapture.incident_id == incident_id)
+        if camera_id:
+            stmt = stmt.where(FaceCapture.camera_id == camera_id)
+        if matched_only:
+            stmt = stmt.where(FaceCapture.matched_record_id.is_not(None))
+        if risk_level:
+            stmt = stmt.where(FaceCapture.matched_risk_level == risk_level)
+        if since:
+            stmt = stmt.where(FaceCapture.timestamp >= since)
+        rows = s.scalars(stmt.offset(offset).limit(limit)).all()
+        return [_face_to_dict(r) for r in rows]
+
+
+@app.get("/api/faces/{face_id}")
+def get_face(face_id: int, _: None = Depends(rate_limit)):
+    with session_scope() as s:
+        r = s.get(FaceCapture, face_id)
+        if r is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return _face_to_dict(r)
+
+
+@app.get("/api/incidents/{incident_id}/faces")
+def faces_for_incident(incident_id: int, _: None = Depends(rate_limit)):
+    """All faces captured during one violence incident."""
+    with session_scope() as s:
+        rows = s.scalars(
+            select(FaceCapture)
+            .where(FaceCapture.incident_id == incident_id)
+            .order_by(FaceCapture.timestamp.asc())
+        ).all()
+        return {
+            "incident_id": incident_id,
+            "total_faces": len(rows),
+            "matched_count": sum(1 for r in rows if r.matched_record_id),
+            "faces": [_face_to_dict(r) for r in rows],
+        }
+
+
+# ----------------------------------------------------------------- police DB (mock)
+
+
+@app.get("/api/police-records")
+def list_police_records(_: None = Depends(rate_limit)):
+    """List all suspect records in the (mock) police DB."""
+    from src.face.police_mock import get_police_db, record_to_dict
+    try:
+        db = get_police_db(Path("data/police_records_mock.csv"))
+        return [record_to_dict(r) for r in db.list_all()]
+    except Exception:
+        log.exception("police DB read failed")
+        return []
+
+
+@app.get("/api/police-records/{record_id}")
+def get_police_record(record_id: str, _: None = Depends(rate_limit)):
+    from src.face.police_mock import get_police_db, record_to_dict
+    db = get_police_db(Path("data/police_records_mock.csv"))
+    rec = db.get(record_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="not found")
+    return record_to_dict(rec)
+
+
+# ----------------------------------------------------------------- plate sightings (surveillance)
+
+
+@app.get("/api/plates")
+def list_plate_sightings(
+    plate: Optional[str] = None,
+    camera_id: Optional[str] = None,
+    cross_camera_only: bool = False,
+    since: Optional[datetime] = None,
+    limit: int = Query(default=50, le=1000),
+    offset: int = 0,
+    _: None = Depends(rate_limit),
+):
+    """Surveillance log of every plate seen on every camera."""
+    with session_scope() as s:
+        stmt = select(PlateSighting).order_by(PlateSighting.timestamp.desc())
+        if plate:
+            stmt = stmt.where(PlateSighting.plate_text.like(f"%{plate.upper()}%"))
+        if camera_id:
+            stmt = stmt.where(PlateSighting.camera_id == camera_id)
+        if cross_camera_only:
+            stmt = stmt.where(PlateSighting.is_cross_camera_match == True)  # noqa: E712
+        if since:
+            stmt = stmt.where(PlateSighting.timestamp >= since)
+        rows = s.scalars(stmt.offset(offset).limit(limit)).all()
+        return [
+            {
+                "id": r.id,
+                "plate_text": r.plate_text,
+                "camera_id": r.camera_id,
+                "timestamp": r.timestamp.isoformat() + "Z",
+                "ocr_confidence": r.ocr_confidence,
+                "vehicle_class": r.vehicle_class,
+                "vehicle_color": r.vehicle_color,
+                "global_id": r.global_id,
+                "plate_crop_path": r.plate_crop_path,
+                "is_cross_camera_match": r.is_cross_camera_match,
+            }
+            for r in rows
+        ]
+
+
+@app.get("/api/plates/{plate_text}/history")
+def plate_history(plate_text: str, limit: int = Query(default=200, le=2000), _: None = Depends(rate_limit)):
+    """All sightings of a specific plate, oldest → newest, across all cameras."""
+    with session_scope() as s:
+        rows = s.scalars(
+            select(PlateSighting)
+            .where(PlateSighting.plate_text == plate_text.upper())
+            .order_by(PlateSighting.timestamp.asc())
+            .limit(limit)
+        ).all()
+        cameras_seen = sorted({r.camera_id for r in rows})
+        return {
+            "plate_text": plate_text.upper(),
+            "total_sightings": len(rows),
+            "cameras_seen": cameras_seen,
+            "first_seen": rows[0].timestamp.isoformat() + "Z" if rows else None,
+            "last_seen": rows[-1].timestamp.isoformat() + "Z" if rows else None,
+            "sightings": [
+                {
+                    "id": r.id,
+                    "camera_id": r.camera_id,
+                    "timestamp": r.timestamp.isoformat() + "Z",
+                    "ocr_confidence": r.ocr_confidence,
+                    "vehicle_class": r.vehicle_class,
+                    "is_cross_camera_match": r.is_cross_camera_match,
+                    "plate_crop_path": r.plate_crop_path,
+                }
+                for r in rows
+            ],
+        }
 
 
 # ----------------------------------------------------------------- violations
@@ -614,6 +787,105 @@ def live_cameras(_: None = Depends(rate_limit)):
         return {"cameras": get_all_live_cameras()}
     except Exception:
         return {"cameras": []}
+
+
+# ----------------------------------------------------------------- camera management
+
+
+class AddCameraIn(BaseModel):
+    source: str = Field(min_length=1, description="RTSP URL, file path, or webcam index")
+    name: str = Field(default="", max_length=128)
+    fps_cap: int = Field(default=30, ge=1, le=120)
+    loop: bool = Field(default=False, description="Loop video files on EOF")
+
+
+@app.post("/api/cameras/add")
+def add_camera(body: AddCameraIn, _: User = Depends(require_role("admin", "supervisor"))):
+    """Dynamically add a camera and start its pipeline."""
+    try:
+        from src.pipeline.runner import _shared_orchestrator
+        if _shared_orchestrator is None:
+            raise HTTPException(status_code=503, detail="Pipeline not initialized")
+        
+        # Auto-detect loop for file sources
+        loop = body.loop
+        source = body.source.strip()
+        if not loop and not source.startswith(("rtsp://", "http://", "https://")):
+            # Looks like a file path or webcam — auto-loop for files
+            from pathlib import Path as _P
+            if _P(source).suffix.lower() in ('.mp4', '.avi', '.mkv', '.mov', '.webm'):
+                loop = True
+
+        camera_id = _shared_orchestrator.add_camera(
+            source=source,
+            name=body.name,
+            fps_cap=body.fps_cap,
+            loop=loop,
+        )
+        log.info("camera_added", camera_id=camera_id, source=source)
+        return {"camera_id": camera_id, "source": source, "loop": loop}
+    except Exception as e:
+        log.exception("add_camera_failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/cameras/{camera_id}", status_code=200)
+def remove_camera(camera_id: str, _: User = Depends(require_role("admin", "supervisor"))):
+    """Stop and remove a running camera pipeline."""
+    try:
+        from src.pipeline.runner import _shared_orchestrator
+        if _shared_orchestrator is None:
+            raise HTTPException(status_code=503, detail="Pipeline not initialized")
+        
+        removed = _shared_orchestrator.remove_camera(camera_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail=f"Camera {camera_id} not found")
+        log.info("camera_removed", camera_id=camera_id)
+        return {"removed": camera_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/cameras/samples")
+def list_samples(_: None = Depends(rate_limit)):
+    """List available sample video files from data/samples/."""
+    samples_dir = Path(settings.evidence_dir).parent / "samples"
+    if not samples_dir.exists():
+        return {"samples": []}
+    
+    exts = {'.mp4', '.avi', '.mkv', '.mov', '.webm'}
+    samples = []
+    for f in sorted(samples_dir.iterdir()):
+        if f.suffix.lower() in exts:
+            size_mb = round(f.stat().st_size / (1024 * 1024), 1)
+            samples.append({
+                "filename": f.name,
+                "path": str(f.relative_to(Path(settings.evidence_dir).parent.parent)).replace("\\", "/"),
+                "size_mb": size_mb,
+            })
+    return {"samples": samples}
+
+
+@app.get("/api/cameras/templates")
+def list_camera_templates(_: None = Depends(rate_limit)):
+    """List pre-configured camera templates from cameras.yaml."""
+    try:
+        from src.pipeline.runner import _shared_orchestrator
+        if _shared_orchestrator is None:
+            return {"templates": []}
+        templates = []
+        for spec in _shared_orchestrator.camera_templates:
+            templates.append({
+                "id": spec.id,
+                "name": spec.name,
+                "source": spec.source,
+                "fps_cap": spec.fps_cap,
+            })
+        return {"templates": templates}
+    except Exception:
+        return {"templates": []}
 
 
 # ----------------------------------------------------------------- settings

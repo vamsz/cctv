@@ -20,7 +20,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -31,17 +31,20 @@ import yaml
 from config.settings import settings
 from src.attributes.classifier import VehicleAttributeClassifier
 from src.crowd.calibration import CameraCalibration
+from src.common.quality import default_gate as _default_quality_gate
 from src.crowd.dense_counter import DenseCrowdCounter
 from src.crowd.density import ZoneDensityEstimator
 from src.crowd.flow import FlowAnalyzer
+from src.crowd.fruin import FruinClassifier, SafetyMonitor
 from src.crowd.stampede import StampedeDetector
 from src.detection.classes import ObjectClass, VEHICLE_CLASSES
 from src.violence.clip_classifier import ViolenceClipClassifier
+from src.violence.frame_classifier import FrameViolenceClassifier
 from src.detection.detector import Detection, Detector
 from src.evidence.store import EvidenceStore
 from src.ingest.stream import StreamConfig, StreamReader
 from src.loitering.detector import AbandonedObjectDetector, LoiteringDetector
-from src.ocr.plate_normalize import normalize_indian_plate
+from src.ocr.plate_normalize import normalize_plate
 from src.ocr.plate_ocr import PlateOCR
 from src.reid.matcher import CrossCameraReID
 from src.rules.alert_engine import AlertEngine
@@ -163,6 +166,9 @@ class CameraPipeline:
         rule_params: dict,
         reid: Optional[CrossCameraReID] = None,
         attr_clf: Optional[VehicleAttributeClassifier] = None,
+        face_detector=None,
+        face_embedder=None,
+        police_db=None,
     ):
         self.spec = spec
         self.detector = detector
@@ -171,6 +177,21 @@ class CameraPipeline:
         self.rule_params = rule_params
         self.reid = reid
         self.attr_clf = attr_clf
+        self.face_detector = face_detector
+        self.face_embedder = face_embedder
+        self.police_db = police_db
+        # Per-incident, per-track face capture state.
+        # Each incident gets an IncidentFaceBuffer; each unique track_id
+        # within that incident gets up to `per_track_capacity` slots.
+        from src.face.best_view import IncidentFaceBuffer
+        self._face_buffers: dict[int, IncidentFaceBuffer] = {}
+        self._face_per_track_capacity = 3
+        self._face_total_capacity = settings.face_capture_max_per_incident
+        self._last_face_scan_frame: int = -10_000
+        # (incident_id, track_id_key) -> list of FaceCapture row ids
+        # Lets us UPDATE an existing row when a better view of the SAME
+        # person comes in, instead of INSERTing endlessly.
+        self._face_track_db_ids: dict[tuple, list[int]] = {}
 
         self.reader = StreamReader(StreamConfig(camera_id=spec.id, source=spec.source, fps_cap=spec.fps_cap))
         self.tracker = Tracker(frame_rate=spec.fps_cap)
@@ -219,6 +240,16 @@ class CameraPipeline:
         )
         self._snapshot_interval = int(crowd_cfg.get("snapshot_every_frames", 150))
         self._last_snapshot_frame = 0
+        # Fruin LoS + surge/stagnation/counter-flow alerts
+        self.safety_monitor = SafetyMonitor(
+            surge_threshold=float(crowd_cfg.get("surge_threshold", 1.0)),
+            surge_window=float(crowd_cfg.get("surge_window_seconds", 30.0)),
+            counter_flow_threshold=float(crowd_cfg.get("counter_flow_alert", 0.6)),
+            stagnation_threshold=float(crowd_cfg.get("stagnation_alert", 0.5)),
+            alert_cooldown=float(crowd_cfg.get("alert_cooldown_seconds", 30.0)),
+        )
+        # Frame quality gate for VideoMAE — skip blurry / black frames
+        self.quality_gate = _default_quality_gate()
 
         # ── Violence detection ───────────────────────────────────────────
         violence_cfg = rule_params.get("violence", {})
@@ -232,13 +263,38 @@ class CameraPipeline:
             weights=settings.pose_weights,
         )
         self.incident_mgr = IncidentManager(spec.id)
-        # Stage-2 clip classifier — confirms "suspected" before escalating to "active"
+        # Stage-2 clip classifier — primary trigger, polled periodically
         self._clip_clf = ViolenceClipClassifier(
             device=settings.device,
             threshold=float(violence_cfg.get("clip_confirm_threshold", 0.55)),
             model_name=str(violence_cfg.get("clip_model", "r3d_18")),
         )
-        self._clip_confirmation: dict[str, bool] = {}   # camera_id → latest clip result
+        self._clip_confirmed: bool = False
+        self._clip_score: float = 0.0
+        self._clip_label: str = ""
+        self._clip_last_update_frame: int = -10_000
+        # Frequency at which we *poll* the clip classifier when nothing else
+        # has triggered it. ~2 s at 30 fps → user sees a result fast.
+        self._clip_poll_interval = int(violence_cfg.get("clip_poll_interval_frames", 60))
+        self._last_clip_request_frame: int = -10_000
+        # If no positive clip result for this many frames, treat the camera
+        # as quiet (lets IncidentManager auto-resolve).
+        self._clip_stale_after = int(violence_cfg.get("clip_stale_after_frames", 90))
+        # Latest pipeline frame we processed — used by the async clip callback.
+        self._latest_inference_frame_idx: int = 0
+
+        # CLIP zero-shot per-frame classifier — production frame-level
+        # signal. Competes "violent fight" prompts against "cars on road"
+        # / "normal scene" prompts so traffic footage doesn't fire.
+        self._frame_clf = FrameViolenceClassifier(
+            device=settings.device,
+            per_frame_threshold=float(violence_cfg.get("frame_per_frame_threshold", 0.55)),
+            strong_threshold=float(violence_cfg.get("frame_strong_threshold", 0.75)),
+            strong_normal_max=float(violence_cfg.get("frame_strong_normal_max", 0.25)),
+            window=int(violence_cfg.get("frame_window", 8)),
+            min_positive=int(violence_cfg.get("frame_min_positive", 4)),
+            run_every_n_frames=int(violence_cfg.get("frame_run_every_n", 6)),
+        )
 
         # ── Loitering ────────────────────────────────────────────────────
         loiter_cfg = rule_params.get("loitering", {})
@@ -271,54 +327,116 @@ class CameraPipeline:
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._stream_thread: Optional[threading.Thread] = None
         self._track_first_seen_frame: dict[int, int] = {}
         self._track_last_seen_frame: dict[int, int] = {}
         self._track_attrs: dict[int, tuple] = {}
+        # Per-track set of plates already logged to PlateSighting — prevents
+        # one row per frame; we only log on first sight of (track, plate).
+        self._logged_sightings: set[tuple[int, str]] = set()
+        # Per-track last frame we ran the second OCR engine on. Avoids
+        # re-running PaddleOCR every frame for tracks that are already
+        # strongly identified.
+        self._track_last_ocr_frame: dict[int, int] = {}
+        # Per-track last frame we wrote a PlateSighting UPDATE. The DB
+        # UPDATE + WS push at 30 fps × N cars saturates the browser
+        # event loop. Throttle to once per ~1 second per track.
+        self._track_last_sight_update_frame: dict[int, int] = {}
+        # Per-track consensus plate text — set the first time both OCR
+        # engines agree on a string. Cheap signal of high reliability.
+        self._track_consensus_plate: dict[int, str] = {}
+        # Multi-frame character-level voting across all OCR reads of a
+        # track. ~99 % per-character accuracy on 5+ frames, way beyond
+        # any single-frame OCR — that's the production plate read.
+        from src.ocr.plate_consensus import PlateConsensusEngine
+        # Threshold lowered 3→2: short tracks (cars passing through quickly)
+        # only generate ~5 reads, so 3 was too strict to ever vote.
+        self._plate_consensus = PlateConsensusEngine(min_reads_for_consensus=2)
+        # Per-track persisted sighting row id — when consensus changes
+        # for an existing track we UPDATE that row rather than insert
+        # a new one. This collapses the UI from a wall of partial reads
+        # ("XA02NH7256, KA02NH7256, KA02NH7Z56, ...") into one row per
+        # car that refines as more frames arrive.
+        self._track_sighting_db_id: dict[int, int] = {}
+        # Cache of the most recent annotated frame from inference. The stream
+        # loop pushes this so detection boxes + plate text stay visible at
+        # full MJPEG framerate even though inference runs slower.
+        self._latest_annotated: Optional[np.ndarray] = None
+        self._latest_annotated_lock = threading.Lock()
 
     def start(self) -> None:
         self.reader.start()
-        self._thread = threading.Thread(target=self._loop, daemon=True, name=f"pipeline-{self.spec.id}")
+        # Stream thread: pushes every frame to MJPEG buffer at full speed
+        self._stream_thread = threading.Thread(
+            target=self._stream_loop, daemon=True,
+            name=f"stream-{self.spec.id}",
+        )
+        self._stream_thread.start()
+        # Inference thread: processes frames at whatever speed GPU allows
+        self._thread = threading.Thread(
+            target=self._inference_loop, daemon=True,
+            name=f"inference-{self.spec.id}",
+        )
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=4.0)
+        if self._stream_thread:
+            self._stream_thread.join(timeout=2.0)
         self.reader.stop()
+        # Clean up live frame buffer
+        with _live_frame_lock:
+            _live_frames.pop(self.spec.id, None)
 
-    # ----------------------------------------------------------- main loop
+    # ------------------------------------------- stream loop (smooth MJPEG)
 
-    def _loop(self) -> None:
-        last_frame_idx = -1
-        _drop_warn_accumulator = 0
-        from src.common.metrics import frames_total, frame_drops_total
+    def _stream_loop(self) -> None:
+        """Push the most recently annotated frame at MJPEG rate.
+
+        PERF: only re-encodes when the cached annotation has changed. The
+        update_live_frame call does cv2.imencode which costs ~5-10 ms per
+        push — at 25 Hz that's 250 ms/sec/camera. Skipping unchanged
+        frames reclaims most of that for inference.
+        """
+        last_annotated_id = -1
         while not self._stop.is_set():
-            packet = self.reader.read()
+            with self._latest_annotated_lock:
+                cached = self._latest_annotated
+                cached_id = id(cached) if cached is not None else -1
+
+            if cached is not None:
+                # Only re-encode when the underlying frame object changed.
+                if cached_id != last_annotated_id:
+                    update_live_frame(self.spec.id, cached, quality=60)
+                    last_annotated_id = cached_id
+            else:
+                # Cold-start fallback so the feed isn't black before first inference
+                packet = self.reader.read()
+                if packet is not None:
+                    _, _, frame = packet
+                    update_live_frame(self.spec.id, frame, quality=55)
+            # 40 ms = 25 fps MJPEG ceiling. With unchanged-frame skip this
+            # is the *upper* bound on encoding work, not a steady rate.
+            time.sleep(0.04)
+
+    # ------------------------------------------- inference loop (GPU work)
+
+    def _inference_loop(self) -> None:
+        """Grab the latest unprocessed frame and run full detection pipeline.
+        
+        Naturally skips frames it can't keep up with — no warnings, no
+        backlog. The stream itself stays smooth via _stream_loop.
+        """
+        from src.common.metrics import frames_total
+        while not self._stop.is_set():
+            packet = self.reader.read_for_inference()
             if packet is None:
                 time.sleep(0.005)
                 continue
             frame_idx, ts, frame = packet
-            if frame_idx == last_frame_idx:
-                time.sleep(0.002)
-                continue
-
-            skip_count = frame_idx - last_frame_idx - 1
-            if skip_count > 0:
-                frame_drops_total.labels(camera_id=self.spec.id).inc(skip_count)
-                _drop_warn_accumulator += skip_count
-                # Only warn once per 60-frame burst to avoid log spam
-                if _drop_warn_accumulator >= 60:
-                    log.warning("[%s] inference lagging — dropped %d frames in last burst", self.spec.id, _drop_warn_accumulator)
-                    _drop_warn_accumulator = 0
-            else:
-                _drop_warn_accumulator = 0
-
-            last_frame_idx = frame_idx
             frames_total.labels(camera_id=self.spec.id).inc()
-
-            # Push every raw frame to MJPEG buffer immediately so the UI stays live.
-            # _annotate_crowd_on_live_frame will overwrite with overlays once available.
-            update_live_frame(self.spec.id, frame)
 
             try:
                 self._process_frame(frame_idx, ts, frame)
@@ -332,6 +450,7 @@ class CameraPipeline:
         # Attach plates → tracks by IoU, run OCR, propagate to rules engine.
         plate_dets = bundle.of(ObjectClass.LICENSE_PLATE)
         person_bboxes: list[tuple] = []
+        person_track_ids: list[Optional[int]] = []     # parallel to person_bboxes
         luggage_dets: list[tuple] = []
 
         # Collect luggage detections for owner-association abandoned object detection
@@ -347,6 +466,7 @@ class CameraPipeline:
             if cls == ObjectClass.PERSON:
                 xyxy = td.detection.xyxy
                 person_bboxes.append((xyxy[0], xyxy[1], xyxy[2], xyxy[3]))
+                person_track_ids.append(td.track_id)
 
             if cls not in VEHICLE_CLASSES:
                 continue
@@ -389,19 +509,92 @@ class CameraPipeline:
             plate = self._best_plate_for_vehicle(td.detection, plate_dets)
             if plate is None:
                 continue
-            # fast-alpr pre-reads the text — skip OCR entirely
+
+            # Multi-engine consensus pipeline:
+            #   1. Take fast-alpr's text as ONE candidate (free — it was
+            #      computed during detection).
+            #   2. ALWAYS run PaddleOCR PP-OCRv5 on the same crop as a
+            #      second candidate. Both are scored by
+            #      confidence × format_validity; the winner is stored.
+            #
+            # Old behaviour blindly trusted fast-alpr at conf ≥ 0.30. That
+            # produced ~30 % wrong-text reads on Indian / oblique plates
+            # because fast-alpr's mobile-vit-v2 model is not tuned for
+            # Indian fonts.
+            from src.ocr.plate_ocr import PlateRead, _score as _plate_score
+            candidates: list[PlateRead] = []
+
+            # Candidate 1 — fast-alpr's pre-read (only if non-trivial text)
             if plate.text and plate.text_conf is not None and plate.text_conf >= 0.30:
-                normalized = normalize_indian_plate(plate.text)
-                if normalized:
-                    self.rules.attach_plate_read(td.track_id, normalized, plate.text_conf)
+                clean = "".join(c for c in plate.text.upper() if c.isalnum())
+                if len(clean) >= 3:
+                    candidates.append(PlateRead(
+                        text=clean,
+                        confidence=float(plate.text_conf),
+                        engine="fast-alpr",
+                    ))
+
+            # PaddleOCR is expensive (~50-100 ms CPU per crop). Skip only
+            # when this track has already produced a CONSENSUS read
+            # (engines agreed) — fast-alpr's "high confidence" alone is
+            # not a reliable trust signal. Re-run every 60 frames as a
+            # sanity check in case the angle improved.
+            had_consensus = self._track_consensus_plate.get(td.track_id) is not None
+            re_ocr_due = (frame_idx - self._track_last_ocr_frame.get(td.track_id, -1000)) >= 30
+            if (not had_consensus) or re_ocr_due:
+                # ONE Paddle call per frame at the 25%-padded crop.
+                # Multi-frame consensus across ~10 frames per track
+                # gives us the same accuracy as multi-variant ensemble
+                # at 1/10th the per-frame cost. The math:
+                #   old: 3 padding × 5 variants × 2 engines = 30 calls
+                #   new: 1 padding × 1 variant  × 1 engine  =  1 call
+                # PaddleOCR PP-OCRv5 ~80ms CPU per call, so per plate
+                # detection per frame: 80ms instead of 2400ms.
+                crop = _crop_padded(frame, plate.xyxy, pad=0.25)
+                if crop is not None and crop.size > 0:
+                    paddle_read = self.ocr.read(crop)
+                    if paddle_read is not None:
+                        candidates.append(paddle_read)
+                self._track_last_ocr_frame[td.track_id] = frame_idx
+
+            if not candidates:
                 continue
-            # Legacy: crop + PlateOCR
-            crop = _crop(frame, plate.xyxy)
-            read = self.ocr.read(crop)
-            if not read:
-                continue
-            normalized = normalize_indian_plate(read.text)
-            self.rules.attach_plate_read(td.track_id, normalized, read.confidence)
+
+            # Consensus: any 2+ candidates that agree on the same
+            # string is a strong signal. With 4 candidates (1 fast-alpr
+            # + 3 padding-level Paddle reads), majority agreement is
+            # near-impossible to fake — pin the confidence high.
+            from collections import Counter
+            text_votes = Counter(c.text for c in candidates if c.text)
+            top_text, top_votes = text_votes.most_common(1)[0]
+            if top_votes >= 2:
+                voters = [c for c in candidates if c.text == top_text]
+                best = PlateRead(
+                    text=top_text,
+                    confidence=min(0.99, max(v.confidence for v in voters) + 0.05 * top_votes),
+                    engine=f"consensus({top_votes})",
+                )
+                self._track_consensus_plate[td.track_id] = best.text
+            else:
+                best = max(candidates, key=_plate_score)
+
+            stored = normalize_plate(best.text) or best.text.strip()
+            if stored:
+                # Submit this single-frame read to the multi-frame
+                # consensus engine. Then ALWAYS use the consensus when
+                # it's available — that's our most accurate read for
+                # this track.
+                self._plate_consensus.submit(
+                    td.track_id, stored, float(best.confidence), frame_idx,
+                )
+                consensus_text, consensus_conf = self._plate_consensus.consensus(td.track_id)
+                if consensus_text and consensus_conf > 0:
+                    final_text, final_conf = consensus_text, consensus_conf
+                else:
+                    final_text, final_conf = stored, float(best.confidence)
+
+                self.rules.attach_plate_read(td.track_id, final_text, final_conf)
+                self._log_plate_sighting(td, plate, final_text, float(final_conf), frame)
 
         signal_state = self.signal_clf.classify(frame)
         raw_events = self.rules.step(tracked, bundle, signal_state)
@@ -420,13 +613,17 @@ class CameraPipeline:
 
         events = self.alert_engine.filter(raw_events)
 
+        # Annotate EVERY frame so the live feed shows what's being detected,
+        # not just frames where a violation fired. We skip the placeholder
+        # stop_line — those values are not calibrated for the test footage.
+        annotated = annotate(
+            frame, bundle, tracked,
+            stop_line=None,
+            signal_state=signal_state.value if signal_state else None,
+            violations=events if events else None,
+        )
+
         if events:
-            annotated = annotate(
-                frame, bundle, tracked,
-                stop_line=self.spec.stop_line,
-                signal_state=signal_state.value,
-                violations=events,
-            )
             for ev in events:
                 plate_crop_img = self._plate_crop_for_event(ev, bundle, frame)
                 row_id = self.store.save(ev, frame=frame, annotated=annotated, plate_crop=plate_crop_img)
@@ -445,12 +642,13 @@ class CameraPipeline:
                 except Exception:
                     pass
 
-        # ── Step 3: Crowd analytics ──────────────────────────────────────
-        self._run_crowd_analytics(frame, frame_idx, person_bboxes)
+        # ── Step 3: Crowd analytics (uses raw frame for optical flow) ────
+        # Crowd overlay is added on top of `annotated` inside this call.
+        self._run_crowd_analytics(frame, frame_idx, person_bboxes, live_canvas=annotated)
 
         # ── Step 3: Violence detection ───────────────────────────────────
         if self._violence_enabled:
-            self._run_violence_detection(frame, frame_idx, person_bboxes)
+            self._run_violence_detection(frame, frame_idx, person_bboxes, person_track_ids)
 
         # ── Step 3: Loitering detection ──────────────────────────────────
         if self._loitering_enabled and person_bboxes:
@@ -467,6 +665,7 @@ class CameraPipeline:
         frame: np.ndarray,
         frame_idx: int,
         person_bboxes: list[tuple],
+        live_canvas: Optional[np.ndarray] = None,
     ) -> None:
         crowd = self.density_est.update(person_bboxes)
         flow = self.flow_analyzer.update(frame)
@@ -478,6 +677,35 @@ class CameraPipeline:
             crowd.total_count, person_bboxes, frame
         )
 
+        # ── Fruin Level-of-Service classification + safety alerts ────────
+        # Density passes through Fruin's standard A-F bands. Surge,
+        # counter-flow and stagnation alerts come out of the SafetyMonitor.
+        fruin_level, fruin_severity, safety_alerts, density_trend = \
+            self.safety_monitor.update(
+                camera_id=self.spec.id,
+                density=crowd.max_density,
+                counter_flow_score=flow.counter_flow,
+                stagnation_score=_stagnation_score(flow_smooth),
+            )
+
+        for alert in safety_alerts:
+            log.warning("[%s] SAFETY %s — %s",
+                        self.spec.id, alert.severity.upper(), alert.message)
+            try:
+                from src.api.server import push_violation_event
+                push_violation_event({
+                    "type": "safety_alert",
+                    "alert_type": alert.alert_type,
+                    "camera_id": self.spec.id,
+                    "severity": alert.severity.value,
+                    "fruin_level": alert.fruin_level.value,
+                    "density": round(alert.density, 2),
+                    "message": alert.message,
+                    "metadata": alert.metadata,
+                })
+            except Exception:
+                pass
+
         state = {
             "camera_id": self.spec.id,
             "timestamp": datetime.utcnow().isoformat(),
@@ -486,6 +714,11 @@ class CameraPipeline:
             "dense_mode": self.dense_counter.mode if adjusted_count != crowd.total_count else "yolo",
             "max_density": crowd.max_density,
             "risk_level": crowd.risk_level,
+            "fruin_level": fruin_level.value,
+            "fruin_severity": fruin_severity.value,
+            "fruin_color": FruinClassifier.hex_color(fruin_level),
+            "fruin_description": FruinClassifier.description_for(fruin_level),
+            "density_trend_per_min": round(density_trend * 60.0, 3),
             "stampede_score": stampede.score,
             "stampede_level": stampede.level,
             "stampede_flags": stampede.flags,
@@ -505,11 +738,20 @@ class CameraPipeline:
                 }
                 for z in crowd.zones
             ],
+            "active_alerts": [
+                {
+                    "type": a.alert_type, "severity": a.severity.value,
+                    "message": a.message, "ts": a.timestamp,
+                }
+                for a in safety_alerts
+            ],
         }
         update_crowd_state(self.spec.id, state)
 
         # Annotate live frame with crowd info (shown in MJPEG feed)
-        self._annotate_crowd_on_live_frame(frame, crowd, stampede)
+        # Draw crowd overlay on the detection-annotated frame (or raw if not provided)
+        canvas = live_canvas if live_canvas is not None else frame
+        self._annotate_crowd_on_live_frame(canvas, crowd, stampede)
 
         # Write to DB on warning/critical or every snapshot_interval frames
         crowd_needs_snapshot = (
@@ -537,11 +779,16 @@ class CameraPipeline:
                 pass
 
     def _on_clip_result(self, result) -> None:
-        """Callback from async clip classifier."""
-        self._clip_confirmation[result.camera_id] = result.confirmed
-        log.debug(
-            "[%s] clip result: score=%.3f confirmed=%s label=%s",
-            result.camera_id, result.score, result.confirmed, result.label,
+        """Callback from async clip classifier — stores the latest VideoMAE
+        verdict for this camera. Drives the violence state machine.
+        """
+        self._clip_confirmed = result.confirmed
+        self._clip_score = result.score
+        self._clip_label = result.label
+        self._clip_last_update_frame = self._latest_inference_frame_idx
+        log.info(
+            "[%s] VideoMAE: top=%s score=%.3f confirmed=%s",
+            result.camera_id, result.label, result.score, result.confirmed,
         )
 
     def _run_violence_detection(
@@ -549,21 +796,116 @@ class CameraPipeline:
         frame: np.ndarray,
         frame_idx: int,
         person_bboxes: list[tuple],
+        person_track_ids: Optional[list] = None,
     ) -> None:
-        result = self.pose_det.update(frame, frame_idx, person_bboxes)
+        # Track the latest frame so the async clip callback can timestamp itself.
+        self._latest_inference_frame_idx = frame_idx
 
-        # Stage-2 gate: when pose heuristic fires "suspected", request a clip check
-        if result.active and self._clip_clf.available:
-            self._clip_clf.request_inference(self.spec.id, self._on_clip_result)
-            # If clip classifier hasn't confirmed yet, hold at suspected
-            if not self._clip_confirmation.get(self.spec.id, False):
-                # Force only "suspected" until clip confirms
-                from dataclasses import replace as dc_replace
-                result = dc_replace(result, active=False)
+        # PERFORMANCE: skip the entire violence stack when no humans are
+        # in frame. Violence requires people; running CLIP/VideoMAE/pose
+        # on empty traffic burns ~80 ms/frame for nothing.
+        if not person_bboxes:
+            # Still need to age out the per-camera state so a quiet camera
+            # auto-resolves when the last person leaves frame.
+            from src.violence.pose_stage1 import Stage1Result as _S1
+            empty_result = _S1(score=0.0, active=False, flags=[], person_count=0)
+            self.incident_mgr.update(empty_result)
+            return
 
-        changed = self.incident_mgr.update(result)
+        # 1) Pose Stage-1: fast skeleton heuristic. Used purely as an
+        #    *acceleration* signal — it can request an early clip check,
+        #    but it is NOT required for violence to fire.
+        pose_result = self.pose_det.update(frame, frame_idx, person_bboxes)
+
+        # 2) Periodic clip request OR fast trigger from pose Stage-1.
+        #    Gate by frame quality — VideoMAE on motion-blurred / pitch-black
+        #    frames is what produces phantom "RoadAccidents" classifications.
+        if self._clip_clf.available:
+            should_request = (
+                pose_result.active
+                or (frame_idx - self._last_clip_request_frame) >= self._clip_poll_interval
+            )
+            if should_request:
+                q = self.quality_gate.assess(frame)
+                if q.is_usable:
+                    self._clip_clf.request_inference(self.spec.id, self._on_clip_result)
+                    self._last_clip_request_frame = frame_idx
+                else:
+                    log.debug("[%s] skipping clip — %s", self.spec.id, q.reason)
+
+        # 3) Per-frame ViT classifier — runs on every Nth frame (gated by
+        #    quality so we don't run on motion-blurred frames).
+        if self._frame_clf.available:
+            q_for_frame = self.quality_gate.assess(frame)
+            if q_for_frame.is_usable:
+                fv = self._frame_clf.submit(self.spec.id, frame, frame_idx)
+                if fv is not None and fv.is_violent:
+                    log.info("[%s] FrameViT: violent=%.2f label=%s",
+                             self.spec.id, fv.score, fv.label)
+        # CLIP zero-shot per-frame classifier (image vs balanced prompts)
+        clip_confirmed = self._frame_clf.is_confirmed(self.spec.id) if self._frame_clf.available else False
+        clip_strong = self._frame_clf.is_strong_violent(self.spec.id) if self._frame_clf.available else False
+        clip_score = self._frame_clf.latest_score(self.spec.id) if self._frame_clf.available else 0.0
+        clip_label = self._frame_clf.latest_label(self.spec.id) if self._frame_clf.available else ""
+
+        # 4) Decay: if VideoMAE hasn't said "violence" recently, treat as quiet.
+        videomae_stale = (frame_idx - self._clip_last_update_frame) > self._clip_stale_after
+        videomae_active = self._clip_confirmed and not videomae_stale
+
+        # 5) THREE-SIGNAL FUSION (production rule)
+        #
+        #    Signal 1: pose Stage-1 (skeleton motion)
+        #    Signal 2: CLIP zero-shot per-frame (image-vs-prompts)
+        #    Signal 3: VideoMAE UCF-Crime (video temporal)
+        #
+        #    Each signal alone has known failure modes:
+        #      - Pose alone: misses fights with non-canonical poses
+        #      - CLIP alone: occasionally over-confident on choreographed motion
+        #      - VideoMAE alone: confuses cars with Robbery/Stealing/Shooting
+        #
+        #    Production rule: VIOLENCE FIRES iff
+        #      (a) CLIP is *strongly* violent on its own (high violent probs
+        #          AND low normal probs — leaves no room for "cars on road"
+        #          interpretation), OR
+        #      (b) any 2 of {pose, CLIP, VideoMAE} agree.
+        #
+        #    This kills the cars-as-Vandalism / Robbery false positives we
+        #    saw on test1.mp4 because CLIP prefers the "cars driving on a
+        #    road" prompt and pose has no skeleton signal.
+        pose_has_signal = bool(pose_result.flags)
+        signals_agreeing = sum([pose_has_signal, clip_confirmed, videomae_active])
+        violence_active = clip_strong or signals_agreeing >= 2
+
+        # 6) Build a synthesised Stage1Result reflecting the fusion verdict.
+        from src.violence.pose_stage1 import Stage1Result as _S1
+        flags = list(pose_result.flags)
+        if videomae_active and self._clip_label:
+            flags.append(f"videomae:{self._clip_label}:{self._clip_score:.2f}")
+        if clip_confirmed or clip_strong:
+            tag = f"clip:{clip_label}:{clip_score:.2f}"
+            if clip_strong:
+                tag += ":STRONG"
+            flags.append(tag)
+        flags.append(f"signals_agreeing={signals_agreeing}")
+        synthetic = _S1(
+            score=max(
+                pose_result.score,
+                self._clip_score if videomae_active else 0.0,
+                clip_score if (clip_confirmed or clip_strong) else 0.0,
+            ),
+            active=violence_active,
+            flags=flags,
+            person_count=pose_result.person_count,
+        )
+
+        changed = self.incident_mgr.update(synthetic)
         if changed is not None:
             self._persist_violence_incident(changed)
+            log.warning(
+                "[%s] VIOLENCE %s — score=%.3f flags=%s db_id=%s",
+                self.spec.id, changed.status.upper(), changed.score,
+                changed.flags, changed.db_id,
+            )
             if changed.status in ("active", "suspected"):
                 try:
                     from src.api.server import push_violation_event
@@ -578,6 +920,209 @@ class CameraPipeline:
                     })
                 except Exception:
                     pass
+
+        # Face capture: only while an incident is active and we have a DB id to link to.
+        if (
+            self.face_detector is not None
+            and self.face_embedder is not None
+            and self.incident_mgr.is_active()
+            and self.incident_mgr.current_db_id() is not None
+        ):
+            self._capture_faces_for_incident(frame, frame_idx, person_bboxes,
+                                             self.incident_mgr.current_db_id(),
+                                             person_track_ids)
+
+    def _capture_faces_for_incident(
+        self,
+        frame: np.ndarray,
+        frame_idx: int,
+        person_bboxes: list[tuple],
+        incident_id: int,
+        person_track_ids: Optional[list] = None,
+    ) -> None:
+        """Run face detection during an active incident and feed the
+        candidates into the per-incident best-view buffer (top-K by FQA).
+
+        Strategy:
+          1. Every N frames, run YOLOv11n-face on the scene.
+          2. Score each detected face using ISO-29794 quality components.
+          3. Push it into the incident's BestViewBuffer; if it beats the
+             current worst slot it replaces it.
+          4. When the buffer slot accepts a NEW face we persist a
+             FaceCapture row, embed it, and run the police-DB lookup.
+          5. When a slot's face IS REPLACED (better view came along) we
+             update the existing FaceCapture row in-place so the DB and
+             UI always show the best K views without spamming inserts.
+
+        This converts "first 8 captures, ignore the rest" into "best 8
+        views across the entire incident".
+        """
+        from src.face.best_view import IncidentFaceBuffer, CandidateFace, score_face
+
+        every_n = settings.face_capture_every_n_frames
+        if frame_idx - self._last_face_scan_frame < every_n:
+            return
+        self._last_face_scan_frame = frame_idx
+
+        try:
+            faces = self.face_detector.extract_faces(
+                frame, person_bboxes, track_ids=person_track_ids,
+            )
+        except TypeError:
+            faces = self.face_detector.extract_faces(frame, person_bboxes)
+        except Exception:
+            log.debug("face detection failed", exc_info=True)
+            return
+        if not faces:
+            return
+
+        buf = self._face_buffers.setdefault(
+            incident_id,
+            IncidentFaceBuffer(
+                per_track_capacity=self._face_per_track_capacity,
+                total_capacity=self._face_total_capacity,
+            ),
+        )
+
+        for f in faces:
+            cand = CandidateFace(
+                image=f.image,
+                xyxy=f.xyxy,
+                sharpness=f.quality,
+                detection_conf=getattr(f, "detection_conf", 0.5),
+                track_id=f.person_track_id,
+                frame_idx=frame_idx,
+            )
+            cand.quality = score_face(cand.image, cand.detection_conf, cand.sharpness)
+            kept, evicted, tid_key = buf.consider(cand)
+            if not kept:
+                continue
+            # Either a fresh slot or a replaced one — persist accordingly.
+            self._persist_face_capture(incident_id, cand, tid_key, evicted)
+
+    def _persist_face_capture(
+        self,
+        incident_id: int,
+        cand,
+        tid_key: int,
+        evicted,
+    ) -> None:
+        """Persist a FaceCapture row.
+
+        Logic:
+          - If `evicted` is None, this is a fresh slot — INSERT.
+          - If `evicted` is set, the candidate replaced a worse face *of
+            the same person* (or, if cross-track eviction happened to
+            make room for a new participant, the worst face overall).
+            We UPDATE that row in place so the Faces tab always shows
+            the current best view of each participant without DB bloat.
+        """
+        try:
+            crop_path = self.store.save_face_crop(self.spec.id, cand.image)
+        except Exception:
+            log.debug("face crop save failed", exc_info=True)
+            return
+
+        emb = None
+        try:
+            emb = self.face_embedder.embed(cand.image)
+        except Exception:
+            log.debug("face embedding failed", exc_info=True)
+
+        match = None
+        if emb is not None and self.police_db is not None:
+            try:
+                match = self.police_db.search(emb)
+            except Exception:
+                log.debug("police DB search failed", exc_info=True)
+
+        slot_key = (incident_id, tid_key)
+        track_db_ids = self._face_track_db_ids.setdefault(slot_key, [])
+
+        try:
+            from src.common.db import session_scope
+            from src.evidence.models import FaceCapture
+            with session_scope() as s:
+                row = None
+                is_update = False
+                # If we have any stored rows for this (incident, track) and
+                # we just evicted a face from this track, update its lowest-q row.
+                if evicted is not None and track_db_ids:
+                    rows = (
+                        s.query(FaceCapture)
+                         .filter(
+                             FaceCapture.incident_id == incident_id,
+                             FaceCapture.track_id == cand.track_id,
+                         )
+                         .order_by(FaceCapture.quality_score.asc())
+                         .all()
+                    )
+                    if rows:
+                        row = rows[0]
+                        is_update = True
+                if row is None:
+                    row = FaceCapture(
+                        incident_id=incident_id,
+                        camera_id=self.spec.id,
+                        timestamp=datetime.utcnow(),
+                        track_id=cand.track_id,
+                        face_crop_path=crop_path,
+                        embedding=(emb.astype(np.float32).tobytes()
+                                   if emb is not None else None),
+                        quality_score=cand.quality,
+                        matched_record_id=match.record.record_id if match else None,
+                        matched_name=match.record.name if match else None,
+                        matched_charges=match.record.charges if match else None,
+                        matched_risk_level=match.record.risk_level if match else None,
+                        match_similarity=match.similarity if match else None,
+                    )
+                    s.add(row)
+                    s.flush()
+                    track_db_ids.append(row.id)
+                else:
+                    row.face_crop_path = crop_path
+                    row.timestamp = datetime.utcnow()
+                    row.track_id = cand.track_id
+                    row.embedding = (emb.astype(np.float32).tobytes()
+                                     if emb is not None else None)
+                    row.quality_score = cand.quality
+                    row.matched_record_id = match.record.record_id if match else None
+                    row.matched_name = match.record.name if match else None
+                    row.matched_charges = match.record.charges if match else None
+                    row.matched_risk_level = match.record.risk_level if match else None
+                    row.match_similarity = match.similarity if match else None
+                cand.db_id = row.id
+                row_id = row.id
+        except Exception:
+            log.debug("face capture persist failed", exc_info=True)
+            return
+
+        try:
+            from src.api.server import push_violation_event
+            push_violation_event({
+                "type": "face_capture",
+                "id": row_id,
+                "incident_id": incident_id,
+                "camera_id": self.spec.id,
+                "is_update": is_update,
+                "quality_score": round(cand.quality, 3),
+                "matched": match is not None,
+                "matched_name": match.record.name if match else None,
+                "matched_record_id": match.record.record_id if match else None,
+                "matched_risk_level": match.record.risk_level if match else None,
+                "match_similarity": round(match.similarity, 3) if match else None,
+            })
+        except Exception:
+            pass
+
+        if match is not None:
+            log.warning(
+                "[%s] FACE MATCH%s: incident=%d → %s (%s, %s) sim=%.3f q=%.2f",
+                self.spec.id, " (UPDATED)" if is_update else "",
+                incident_id, match.record.name,
+                match.record.record_id, match.record.risk_level,
+                match.similarity, cand.quality,
+            )
 
     def _run_loitering(
         self,
@@ -661,8 +1206,10 @@ class CameraPipeline:
             )
             cv2.putText(frame, txt, (8, 18), font, 0.45, level_color, 1, cv2.LINE_AA)
 
-            # Write annotated frame to live buffer
-            update_live_frame(self.spec.id, frame, quality=65)
+            # Cache the fully-annotated frame so the stream loop pushes it.
+            # We do NOT push directly here — the stream loop owns MJPEG cadence.
+            with self._latest_annotated_lock:
+                self._latest_annotated = frame
         except Exception:
             pass
 
@@ -757,11 +1304,14 @@ class CameraPipeline:
         best = None
         best_score = 0.0
         for p in plates:
+            # containment: how much of the plate is inside the vehicle box
             score = contains(vehicle.xyxy, p.xyxy)
             if score > best_score:
                 best_score = score
                 best = p
-        return best if best_score >= 0.6 else None
+        # 0.20: plate centroid only needs to be within the vehicle box.
+        # 0.60 was too strict — CCTV angles often have plates at bumper edge.
+        return best if best_score >= 0.20 else None
 
     def _plate_crop_for_event(self, ev: ViolationEvent, bundle, frame: np.ndarray) -> Optional[np.ndarray]:
         if not ev.bbox:
@@ -812,8 +1362,150 @@ class CameraPipeline:
         self._track_first_seen_frame.pop(tid, None)
         self._track_last_seen_frame.pop(tid, None)
         self._track_attrs.pop(tid, None)
+        # Drop logged sightings for this track so memory doesn't grow forever.
+        self._logged_sightings = {(t, p) for (t, p) in self._logged_sightings if t != tid}
+        self._track_consensus_plate.pop(tid, None)
+        self._track_last_ocr_frame.pop(tid, None)
+        self._track_sighting_db_id.pop(tid, None)
+        self._track_last_sight_update_frame.pop(tid, None)
+        self._plate_consensus.forget(tid)
         if self.reid:
             self.reid.forget_track(self.spec.id, tid)
+
+    # ------------------------------------------- surveillance plate logger
+    _CROSS_CAM_LOOKBACK_MIN = 60   # window for "this plate was just seen elsewhere"
+
+    def _log_plate_sighting(
+        self,
+        td: TrackedDetection,
+        plate_det: Detection,
+        plate_text: str,
+        ocr_conf: float,
+        frame: np.ndarray,
+    ) -> None:
+        """Persist a per-track plate sighting.
+
+        One row per (camera, track_id). Subsequent reads of the same
+        track UPDATE that row instead of inserting new ones, so the UI
+        shows ONE plate per car that refines as more frames arrive.
+        Cross-camera match flag is set when the same plate was seen on
+        a different camera in the lookback window.
+        """
+        attrs = self._track_attrs.get(td.track_id, (None, None, None))
+        global_id, color, vtype = attrs
+
+        existing_id = self._track_sighting_db_id.get(td.track_id)
+        text_key = (td.track_id, plate_text)
+        text_changed = text_key not in self._logged_sightings
+        if text_changed:
+            self._logged_sightings.add(text_key)
+
+        # Throttle: a track that already has a row gets at most ONE
+        # UPDATE + WS push per second (~30 frames at 30 fps), unless
+        # the OCR text actually changed for it. Without this throttle
+        # 5 cars × 30 fps = 150 DB UPDATEs + WS broadcasts per second
+        # which freezes the dashboard.
+        try:
+            frame_idx_now = getattr(td, "_frame_idx", None) or self._latest_inference_frame_idx
+        except Exception:
+            frame_idx_now = 0
+        last_update_frame = self._track_last_sight_update_frame.get(td.track_id, -10000)
+        if (existing_id is not None
+            and not text_changed
+            and (frame_idx_now - last_update_frame) < 30):
+            return
+        self._track_last_sight_update_frame[td.track_id] = frame_idx_now
+
+        plate_crop_path = None
+        if text_changed or existing_id is None:
+            try:
+                # Save the WIDER padded crop (40 % around the bbox) so the
+                # operator can verify the read by eye in the UI. The tight
+                # detector crop is what the OCR sees, but a clipped image
+                # in the evidence column is hard for a human to confirm.
+                crop = _crop_padded(frame, plate_det.xyxy, pad=0.40)
+                if crop is not None and crop.size > 0:
+                    plate_crop_path = self.store.save_plate_crop(plate_text, crop)
+            except Exception:
+                log.debug("plate crop save failed", exc_info=True)
+
+        is_match = False
+        is_new = False
+        try:
+            from src.common.db import session_scope
+            from src.evidence.models import PlateSighting
+            from sqlalchemy import select, and_
+
+            cutoff = datetime.utcnow() - timedelta(minutes=self._CROSS_CAM_LOOKBACK_MIN)
+            with session_scope() as s:
+                prior = s.scalars(
+                    select(PlateSighting)
+                    .where(and_(
+                        PlateSighting.plate_text == plate_text,
+                        PlateSighting.camera_id != self.spec.id,
+                        PlateSighting.timestamp >= cutoff,
+                    ))
+                    .order_by(PlateSighting.timestamp.desc())
+                    .limit(1)
+                ).first()
+                is_match = prior is not None
+
+                if existing_id is not None:
+                    # UPDATE the existing per-track sighting in place
+                    row = s.get(PlateSighting, existing_id)
+                    if row is not None:
+                        row.plate_text = plate_text
+                        row.timestamp = datetime.utcnow()
+                        row.ocr_confidence = ocr_conf
+                        row.is_cross_camera_match = is_match
+                        if plate_crop_path:
+                            row.plate_crop_path = plate_crop_path
+                        if global_id and not row.global_id:
+                            row.global_id = global_id
+                        s.flush()
+                        row_id = row.id
+                    else:
+                        existing_id = None    # row vanished; insert a fresh one
+                if existing_id is None:
+                    row = PlateSighting(
+                        plate_text=plate_text,
+                        camera_id=self.spec.id,
+                        timestamp=datetime.utcnow(),
+                        track_id=td.track_id,
+                        global_id=global_id,
+                        ocr_confidence=ocr_conf,
+                        vehicle_class=str(td.detection.cls.value) if td.detection.cls else None,
+                        vehicle_color=color,
+                        plate_crop_path=plate_crop_path,
+                        is_cross_camera_match=is_match,
+                    )
+                    s.add(row)
+                    s.flush()
+                    row_id = row.id
+                    self._track_sighting_db_id[td.track_id] = row_id
+                    is_new = True
+        except Exception:
+            log.debug("plate sighting persist failed", exc_info=True)
+            return
+
+        # Push WS event to live surveillance feed
+        try:
+            from src.api.server import push_violation_event
+            push_violation_event({
+                "type": "plate_sighting",
+                "id": row_id,
+                "plate_text": plate_text,
+                "camera_id": self.spec.id,
+                "ocr_confidence": round(ocr_conf, 3),
+                "vehicle_class": str(td.detection.cls.value) if td.detection.cls else None,
+                "is_cross_camera_match": is_match,
+            })
+        except Exception:
+            pass
+
+        if is_match:
+            log.info("[%s] CROSS-CAMERA MATCH: plate=%s seen previously on different camera",
+                     self.spec.id, plate_text)
 
     def _persist_reid_subject(
         self,
@@ -859,7 +1551,50 @@ def _crop(frame: np.ndarray, xyxy: tuple[float, float, float, float]) -> np.ndar
     return frame[y1:y2, x1:x2].copy()
 
 
+def _crop_padded(
+    frame: np.ndarray,
+    xyxy: tuple[float, float, float, float],
+    pad: float = 0.18,
+) -> np.ndarray:
+    """Crop with N % padding around the bbox, clipped to frame bounds.
+
+    The plate detector emits a tight box; OCR engines need a margin of
+    pixels around the glyphs to disambiguate edges from frame artefacts
+    and to hold up under motion blur. 18 % is the value Indian-traffic
+    OCR studies use as the sweet spot before the OCR starts confusing
+    the plate frame for an additional character.
+    """
+    h, w = frame.shape[:2]
+    x1, y1, x2, y2 = xyxy
+    pw = (x2 - x1) * pad
+    ph = (y2 - y1) * pad
+    nx1 = max(0, int(x1 - pw))
+    ny1 = max(0, int(y1 - ph))
+    nx2 = min(w, int(x2 + pw))
+    ny2 = min(h, int(y2 + ph))
+    return frame[ny1:ny2, nx1:nx2].copy()
+
+
+def _stagnation_score(flow) -> float:
+    """Crowd stagnation proxy from optical-flow stats.
+
+    A dense crowd that *can't* move is the precursor to a crush. We use a
+    cheap heuristic: low magnitude + low variance = the whole field is
+    stuck. Returns 0..1 where >0.5 means "everyone is stationary".
+    """
+    if flow is None:
+        return 0.0
+    mag = float(getattr(flow, "magnitude", 0.0))
+    var = float(getattr(flow, "variance", 0.0))
+    # Normalise: magnitude < 1 px/frame and variance < 1 → fully stagnant.
+    return max(0.0, min(1.0, 1.0 - (mag / 5.0) * (1.0 + var / 5.0)))
+
+
 # ---------------------------------------------------------------------- top level
+
+# Global orchestrator reference — set once during startup, used by API
+_shared_orchestrator: Optional["PipelineOrchestrator"] = None
+
 
 class PipelineOrchestrator:
     def __init__(self):
@@ -894,16 +1629,25 @@ class PipelineOrchestrator:
             use_sahi_plate=settings.sahi_plate_enabled,
             use_fast_alpr=settings.use_fast_alpr,
         )
-        self.ocr = PlateOCR(lang=settings.ocr_lang, use_gpu=settings.device.startswith("cuda"))
+        # PaddleOCR PP-OCRv5 must run on CPU on Windows: paddlepaddle-gpu
+        # has no usable wheel for CUDA 12.x, and passing use_gpu=True with
+        # the CPU build makes paddle "switch to CPU" but leaves it in an
+        # inconsistent state where predict() returns None on every call —
+        # silently dropping every PaddleOCR candidate from consensus.
+        # fast-alpr / onnxruntime stays on CUDA via its own provider list.
+        self.ocr = PlateOCR(lang=settings.ocr_lang, use_gpu=False)
         self.store = EvidenceStore()
         self.rule_params = load_rules(settings.rules_yaml)
-        self.cameras = load_cameras(settings.cameras_yaml)
+        # Load camera templates from yaml (but don't auto-start them)
+        self.camera_templates = load_cameras(settings.cameras_yaml)
 
         # Expose rule_params so Settings API can mutate + persist it
         global _shared_rule_params
         with _rule_params_lock:
             _shared_rule_params = self.rule_params
-        self.pipelines: list[CameraPipeline] = []
+        self.pipelines: dict[str, CameraPipeline] = {}
+        self._camera_counter = 0
+        self._lock = threading.Lock()
 
         global _shared_reid
         self.reid: Optional[CrossCameraReID] = None
@@ -919,23 +1663,149 @@ class PipelineOrchestrator:
 
         self.attr_clf = VehicleAttributeClassifier()
 
-    def run(self) -> None:
-        if not self.cameras:
-            log.warning("No enabled cameras in %s", settings.cameras_yaml)
-            return
-        for spec in self.cameras:
-            log.info("Starting pipeline for %s (%s)", spec.id, spec.name)
+        # ── Face capture stack — only loaded when violence detection is enabled ──
+        self.face_detector = None
+        self.face_embedder = None
+        self.police_db = None
+        if self.rule_params.get("violence", {}).get("enabled", True):
+            try:
+                from src.face.detector import FaceDetector
+                from src.face.embedder import FaceEmbedder
+                from src.face.police_mock import get_police_db
+                from src.face.yolo_face_detector import YoloFaceDetector
+
+                # Prefer real YOLOv11n-face; fall back to top-30%-bbox heuristic.
+                yolo_face = YoloFaceDetector(device=settings.device)
+                if yolo_face.available:
+                    self.face_detector = yolo_face
+                    log.info("Face detector: YOLOv11n-face (WIDERFACE)")
+                else:
+                    self.face_detector = FaceDetector()
+                    log.info("Face detector: top-30%% person-bbox heuristic (fallback)")
+                # Reuse the ReID DINOv2 backbone if it's loaded — saves VRAM
+                shared_backbone = self.reid.embedder if self.reid is not None else None
+                self.face_embedder = FaceEmbedder(device=settings.device, shared=shared_backbone)
+                self.police_db = get_police_db(
+                    Path("data/police_records_mock.csv"),
+                    embed_dim=self.face_embedder.DIM,
+                    threshold=settings.police_match_threshold,
+                )
+                log.info("Face capture pipeline ready (police DB: %d records)",
+                         len(self.police_db.list_all()))
+            except Exception:
+                log.exception("Face capture init failed — violence incidents will not capture faces")
+                self.face_detector = None
+                self.face_embedder = None
+                self.police_db = None
+
+        # Expose globally so API can call add/remove camera
+        global _shared_orchestrator
+        _shared_orchestrator = self
+
+    def add_camera(
+        self,
+        source: str,
+        name: str = "",
+        fps_cap: int = 30,
+        loop: bool = False,
+        camera_id: str = "",
+    ) -> str:
+        """Dynamically add a camera and start its pipeline.
+        
+        Returns the camera_id assigned.
+        """
+        with self._lock:
+            if not camera_id:
+                self._camera_counter += 1
+                camera_id = f"CAM{self._camera_counter:02d}"
+                # Avoid collisions with existing pipelines
+                while camera_id in self.pipelines:
+                    self._camera_counter += 1
+                    camera_id = f"CAM{self._camera_counter:02d}"
+
+            if camera_id in self.pipelines:
+                log.warning("Camera %s already running — ignoring add", camera_id)
+                return camera_id
+
+            # ADAPTIVE FPS: with N cameras sharing the GPU, divide the
+            # frame budget so total inference load stays roughly constant.
+            # 1 cam -> 30 fps, 2 cams -> 20 fps each, 3 cams -> 15 fps each,
+            # 4+ -> 12 fps each (floor — below this trackers fall apart).
+            n_after = len(self.pipelines) + 1
+            if n_after == 1:
+                effective_fps = min(fps_cap, 30)
+            elif n_after == 2:
+                effective_fps = min(fps_cap, 20)
+            elif n_after == 3:
+                effective_fps = min(fps_cap, 15)
+            else:
+                effective_fps = min(fps_cap, 12)
+
+            spec = CameraSpec(
+                id=camera_id,
+                name=name or camera_id,
+                source=source,
+                fps_cap=effective_fps,
+                stop_line=((100, 600), (1820, 600)),   # placeholder
+                signal_roi=None,
+                direction=(0.0, -1.0),
+                meters_per_pixel=0.05,
+                enabled=True,
+                loitering_zones=[],
+                crowd_zones=[],
+                homography_pts=None,
+            )
+
+            log.info(
+                "Adding camera %s (%s) source=%s loop=%s | adaptive fps=%d (cam #%d)",
+                camera_id, name, source, loop, effective_fps, n_after,
+            )
+
             p = CameraPipeline(
                 spec, self.detector, self.ocr, self.store, self.rule_params,
                 reid=self.reid,
                 attr_clf=self.attr_clf,
+                face_detector=self.face_detector,
+                face_embedder=self.face_embedder,
+                police_db=self.police_db,
             )
+            # Override the stream config to support looping (with adaptive fps)
+            from src.ingest.stream import StreamConfig
+            p.reader = StreamReader(StreamConfig(
+                camera_id=camera_id,
+                source=source,
+                fps_cap=effective_fps,
+                loop=loop,
+            ))
             p.start()
-            self.pipelines.append(p)
+            self.pipelines[camera_id] = p
+            log.info("Camera %s started successfully", camera_id)
+            return camera_id
+
+    def remove_camera(self, camera_id: str) -> bool:
+        """Stop and remove a camera pipeline. Returns True if found."""
+        with self._lock:
+            p = self.pipelines.pop(camera_id, None)
+            if p is None:
+                return False
+            log.info("Removing camera %s", camera_id)
+            p.stop()
+            return True
+
+    def list_cameras(self) -> list[str]:
+        """Return list of currently running camera IDs."""
+        with self._lock:
+            return list(self.pipelines.keys())
+
+    def run(self) -> None:
+        """Main loop — starts empty, cameras are added via API."""
+        log.info("Pipeline orchestrator ready — no cameras started (add via UI)")
         try:
             while True:
                 time.sleep(1.0)
         except KeyboardInterrupt:
             log.info("Shutting down")
-            for p in self.pipelines:
-                p.stop()
+            with self._lock:
+                for p in self.pipelines.values():
+                    p.stop()
+

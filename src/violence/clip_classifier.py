@@ -42,8 +42,11 @@ except ImportError:
 
 VIDEOMAE_MODEL_ID = "OPear/videomae-large-finetuned-UCF-Crime"
 
-# Keywords to match against UCF-Crime label names → violence score
-_UCF_VIOLENCE_KEYWORDS = {"abuse", "assault", "fight", "robbery", "shooting"}
+# Keywords for the UCF-Crime model's violence classes
+_UCF_VIOLENCE_KEYWORDS = {"abuse", "assault", "fight", "robbery", "shooting",
+                          "burglary", "vandalism", "stealing", "arson"}
+# Labels that explicitly mean "no incident" — only these block confirmation
+_UCF_NORMAL_KEYWORDS = {"normal"}
 
 # Keywords for R3D-18 Kinetics-400 fallback
 _K400_VIOLENCE_KEYWORDS = {
@@ -51,6 +54,7 @@ _K400_VIOLENCE_KEYWORDS = {
     "arm wrestling", "boxing", "karate", "judo", "sword", "shoot gun",
     "shove", "push", "throw", "hitting", "beating",
 }
+_K400_NORMAL_KEYWORDS: set[str] = set()    # Kinetics has no explicit "normal" class
 
 
 @dataclass
@@ -75,7 +79,7 @@ class ViolenceClipClassifier:
     def __init__(
         self,
         device: str = "cpu",
-        threshold: float = 0.55,
+        threshold: float = 0.35,
         model_name: str = "videomae",
     ):
         self._device_str = device
@@ -83,6 +87,7 @@ class ViolenceClipClassifier:
         self._model = None
         self._backend = None    # "videomae" or "r3d18"
         self._violence_indices: list[int] = []
+        self._normal_indices: list[int] = []
         self._id2label: dict[int, str] = {}
 
         self._buffers: dict[str, deque] = {}
@@ -167,10 +172,16 @@ class ViolenceClipClassifier:
                     i for i, label in self._id2label.items()
                     if any(kw in label.lower() for kw in _UCF_VIOLENCE_KEYWORDS)
                 ]
+                self._normal_indices = [
+                    i for i, label in self._id2label.items()
+                    if any(kw in label.lower() for kw in _UCF_NORMAL_KEYWORDS)
+                ]
                 log.info(
-                    "VideoMAE UCF-Crime loaded on %s | violence classes: %s",
+                    "VideoMAE UCF-Crime loaded on %s | violence: %s | normal: %s | threshold=%.2f",
                     device,
                     [self._id2label[i] for i in self._violence_indices],
+                    [self._id2label[i] for i in self._normal_indices],
+                    self._threshold,
                 )
                 return
             except Exception:
@@ -190,6 +201,7 @@ class ViolenceClipClassifier:
                     i for i, name in enumerate(cats)
                     if any(kw in name.lower() for kw in _K400_VIOLENCE_KEYWORDS)
                 ] or list(range(10))
+                self._normal_indices = []   # K400 has no explicit "normal" sentinel
                 log.info(
                     "R3D-18 Kinetics-400 loaded on %s (fallback) | violence classes: %d",
                     device, len(self._violence_indices),
@@ -252,22 +264,60 @@ class ViolenceClipClassifier:
                         logits = self._model(clip)[0]
                         probs = torch.softmax(logits, dim=0).cpu().numpy()
 
-                score = (
-                    float(np.sum(probs[self._violence_indices]))
-                    if self._violence_indices else 0.0
-                )
+                # ── Smart violence scoring (replaces naive sum-vs-threshold) ──
+                # Three signals, OR'd together:
+                #   (1) sum of all violence-class probabilities ≥ threshold
+                #       AND the model's top-1 is NOT explicitly "Normal"
+                #   (2) the single best violence class is itself the top-1
+                #       (model is positively naming a violent action)
+                #   (3) top violence class probability ≥ 1.5× threshold
+                #       (handles cases where one class dominates)
+                v_idx = self._violence_indices
+                if v_idx:
+                    v_probs = probs[v_idx]
+                    violence_sum = float(v_probs.sum())
+                    top_violence_local = int(np.argmax(v_probs))
+                    top_violence_idx = v_idx[top_violence_local]
+                    top_violence_prob = float(v_probs[top_violence_local])
+                else:
+                    violence_sum = 0.0
+                    top_violence_idx = -1
+                    top_violence_prob = 0.0
+
                 top_idx = int(np.argmax(probs))
                 top_label = self._id2label.get(top_idx, str(top_idx))
+                top_is_normal = top_idx in self._normal_indices
+
+                confirmed = (
+                    (violence_sum >= self._threshold and not top_is_normal)
+                    or (top_idx in v_idx and probs[top_idx] >= self._threshold * 0.6)
+                    or (top_violence_prob >= self._threshold * 1.5)
+                )
+
+                # Score reported to the rest of the pipeline: max(sum, top_violence)
+                # so even single-class spikes get reflected in the incident score.
+                score = max(violence_sum, top_violence_prob)
+                # Display label: the violence class with the highest probability
+                # if the top-1 isn't already a violence class.
+                if top_idx in v_idx:
+                    label = top_label
+                elif top_violence_idx >= 0:
+                    label = (
+                        f"{self._id2label.get(top_violence_idx, '?')} "
+                        f"(top1={top_label})"
+                    )
+                else:
+                    label = top_label
 
                 log.debug(
-                    "violence inference: backend=%s top=%s score=%.3f confirmed=%s",
-                    self._backend, top_label, score, score >= self._threshold,
+                    "violence inference: backend=%s top=%s sum=%.3f best_v=%.3f confirmed=%s",
+                    self._backend, top_label, violence_sum, top_violence_prob, confirmed,
                 )
 
                 result = ClipResult(
                     score=round(score, 3),
-                    confirmed=score >= self._threshold,
-                    label=top_label,
+                    confirmed=confirmed,
+                    label=label,
                     camera_id=camera_id,
                 )
                 try:

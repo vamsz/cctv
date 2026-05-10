@@ -424,6 +424,120 @@ select { cursor: pointer; appearance: none; padding-right: 24px;
    DATA TABLES (watchlist / subjects)
 ═══════════════════════════════════════════════ */
 .data-pane { padding: 16px; overflow-y: auto; flex: 1 }
+
+/* Fruin Level-of-Service badge */
+.fruin-badge {
+  display: inline-block;
+  padding: 2px 9px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  color: #0a0a0a;
+  border-radius: 2px;
+  margin-left: 8px;
+}
+/* Active safety-alert strip inside a crowd card */
+.alert-strip {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.alert-row {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 6px 10px;
+  border-left: 3px solid;
+  background: var(--s1);
+  color: var(--fg);
+  border-radius: 0 2px 2px 0;
+}
+.alert-row b { color: var(--acc); margin-right: 6px; letter-spacing: .08em }
+.alert-row.sev-warning   { border-left-color: #eab308; }
+.alert-row.sev-critical  { border-left-color: #f97316; background: rgba(249, 115, 22, 0.08); }
+.alert-row.sev-emergency { border-left-color: #ef4444; background: rgba(239, 68, 68, 0.12); animation: pulse-bg 1.5s infinite; }
+@keyframes pulse-bg { 0%,100%{background:rgba(239,68,68,.12)} 50%{background:rgba(239,68,68,.22)} }
+
+/* Face capture grid */
+.face-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px;
+  padding: 8px 0;
+}
+.face-card {
+  background: var(--s2);
+  border: 1px solid var(--bdr);
+  border-radius: 4px;
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color .15s ease, transform .15s ease;
+}
+.face-card:hover { border-color: var(--acc); transform: translateY(-1px) }
+.face-card.matched { border-color: var(--acc) }
+.face-card.matched.critical { border-color: #ff4646 }
+.face-card.matched.high { border-color: #ff7a1c }
+.face-card .face-img {
+  width: 100%; aspect-ratio: 1/1; object-fit: cover;
+  background: var(--s1);
+  display: block;
+}
+.face-card .face-meta {
+  padding: 8px 10px;
+  border-top: 1px solid var(--bdr);
+  font-family: var(--mono); font-size: 11px;
+}
+.face-card .face-name { color: var(--fg); font-weight: 700; letter-spacing: .03em; margin-bottom: 2px }
+.face-card .face-name.unmatched { color: var(--dim); font-weight: 500 }
+.face-card .face-line2 { color: var(--dim); display: flex; justify-content: space-between }
+.face-risk-pill {
+  display: inline-block; padding: 1px 6px; font-size: 9.5px;
+  font-weight: 700; letter-spacing: .12em; text-transform: uppercase;
+  border-radius: 2px; margin-right: 6px;
+}
+.face-risk-pill.critical { background: #ff4646; color: #fff }
+.face-risk-pill.high     { background: #ff7a1c; color: #fff }
+.face-risk-pill.medium   { background: var(--acc); color: #1a1a1a }
+.face-risk-pill.low      { background: var(--muted); color: var(--fg) }
+
+/* Plate row crop thumbnail */
+.plate-thumb { width: 56px; height: 28px; object-fit: cover; border: 1px solid var(--bdr); background: var(--s1) }
+.plate-match-pill {
+  display: inline-block; padding: 2px 7px; font-size: 9.5px; font-weight: 700;
+  letter-spacing: .1em; text-transform: uppercase; border-radius: 2px;
+  background: rgba(232, 125, 13, 0.18); color: var(--acc); border: 1px solid var(--acc);
+}
+
+/* Modals */
+.modal-back {
+  position: fixed; inset: 0; background: rgba(0,0,0,.7);
+  display: none; align-items: center; justify-content: center;
+  z-index: 90;
+}
+.modal-back.open { display: flex }
+.modal {
+  background: var(--s2); border: 1px solid var(--bdr2); border-radius: 4px;
+  width: min(720px, 92vw); max-height: 84vh; display: flex; flex-direction: column;
+}
+.modal-hdr {
+  padding: 14px 18px; border-bottom: 1px solid var(--bdr);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.modal-title {
+  font-family: var(--mono); font-size: 13px; letter-spacing: .08em;
+  color: var(--acc); font-weight: 700;
+}
+.modal-body { padding: 18px; overflow-y: auto }
+.modal-body .timeline-row {
+  display: grid; grid-template-columns: 60px 110px 1fr auto;
+  gap: 10px; align-items: center; padding: 8px 0;
+  border-bottom: 1px solid var(--bdr);
+  font-size: 12px;
+}
+.modal-body .timeline-row.match { background: rgba(232, 125, 13, 0.05) }
+.modal-body .timeline-row .ts { font-family: var(--mono); color: var(--dim); font-size: 11px }
+.modal-body .timeline-row .cam { font-family: var(--mono); color: var(--acc); font-weight: 700 }
 .sec-hdr { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; flex-wrap: wrap }
 table.data-table { width: 100%; border-collapse: collapse }
 table.data-table th {
@@ -463,6 +577,66 @@ table.data-table .multi-cam td.cam-col { color: var(--med-t); font-weight: 600 }
 }
 .feed-offline-msg .off-icon { font-size: 14px; opacity: .5; font-family: var(--mono); letter-spacing: .05em; color: var(--dim) }
 .feed-offline-msg .off-txt  { font-size: 11px; text-transform: uppercase; letter-spacing: .1em }
+.feed-remove-btn {
+  position: absolute; top: 8px; right: 10px; z-index: 4;
+  background: rgba(0,0,0,.6); border: 1px solid rgba(220,38,38,.5); color: var(--hi-t);
+  padding: 3px 8px; font-size: 9px; font-weight: 700; cursor: pointer;
+  text-transform: uppercase; letter-spacing: .06em; font-family: var(--sans);
+  transition: background .12s, border-color .12s;
+}
+.feed-remove-btn:hover { background: rgba(220,38,38,.3); border-color: var(--hi) }
+.feeds-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 80px 20px; gap: 12px; grid-column: 1/-1;
+}
+.feeds-empty-icon { font-size: 32px; color: var(--muted); opacity: .4 }
+.feeds-empty-title { font-size: 14px; font-weight: 600; color: var(--dim) }
+.feeds-empty-sub { font-size: 12px; color: var(--muted); text-align: center; max-width: 400px; line-height: 1.6 }
+
+/* ═══════════════════════════════════════════════
+   MODAL
+═══════════════════════════════════════════════ */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  animation: fadein .1s ease;
+}
+.modal {
+  background: var(--s1); border: 1px solid var(--bdr2);
+  padding: 28px 28px 20px; width: 460px; max-width: 95vw;
+  box-shadow: 0 24px 64px rgba(0,0,0,.6), 0 0 0 1px rgba(232,125,13,.06);
+}
+.modal-title {
+  font-size: 14px; font-weight: 700; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--fg); margin-bottom: 20px;
+}
+.modal-field { margin-bottom: 14px }
+.modal-field label { display: block; margin-bottom: 5px }
+.modal-field input, .modal-field select {
+  width: 100%; font-size: 12.5px;
+}
+.modal-field .hint {
+  font-size: 10px; color: var(--muted); margin-top: 4px; line-height: 1.5;
+}
+.modal-row { display: flex; gap: 12px; align-items: center }
+.modal-row .modal-field { flex: 1; margin-bottom: 0 }
+.modal-toggle {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+}
+.modal-toggle .lbl { margin-bottom: 0 }
+.modal-actions {
+  display: flex; gap: 8px; justify-content: flex-end;
+  padding-top: 16px; margin-top: 6px; border-top: 1px solid var(--bdr);
+}
+.samples-quick {
+  display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px;
+}
+.sample-chip {
+  font-size: 10px; padding: 3px 8px; background: var(--s3); border: 1px solid var(--bdr2);
+  color: var(--dim); cursor: pointer; font-family: var(--mono);
+  transition: border-color .12s, color .12s;
+}
+.sample-chip:hover { border-color: var(--acc); color: var(--acc) }
 
 /* ═══════════════════════════════════════════════
    SETTINGS
@@ -717,6 +891,29 @@ table.data-table .multi-cam td.cam-col { color: var(--med-t); font-weight: 600 }
       </span>
       Subjects
     </div>
+    <div class="tab" data-tab="plates">
+      <span class="tab-ic">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+          <rect x="1.5" y="3.5" width="9" height="5" rx=".7" stroke="currentColor" stroke-width="1.1"/>
+          <line x1="3.5" y1="6" x2="4.5" y2="6" stroke="currentColor" stroke-width="1.2"/>
+          <line x1="5.5" y1="6" x2="6.5" y2="6" stroke="currentColor" stroke-width="1.2"/>
+          <line x1="7.5" y1="6" x2="8.5" y2="6" stroke="currentColor" stroke-width="1.2"/>
+        </svg>
+      </span>
+      Plates
+      <span class="tab-cnt" id="tab-plates-cnt"></span>
+    </div>
+    <div class="tab" data-tab="faces">
+      <span class="tab-ic">
+        <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+          <circle cx="6" cy="4.5" r="2" stroke="currentColor" stroke-width="1.1"/>
+          <path d="M2.5 11c0-2 1.6-3.5 3.5-3.5S9.5 9 9.5 11" stroke="currentColor" stroke-width="1.1"/>
+          <circle cx="9.5" cy="2.5" r="1.2" fill="currentColor"/>
+        </svg>
+      </span>
+      Faces
+      <span class="tab-cnt" id="tab-faces-cnt"></span>
+    </div>
     <div class="tab" data-tab="settings">
       <span class="tab-ic">
         <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
@@ -845,13 +1042,50 @@ table.data-table .multi-cam td.cam-col { color: var(--med-t); font-weight: 600 }
   <!-- LIVE FEEDS -->
   <div class="pane" id="pane-feeds">
     <div class="filterbar">
-      <span style="font-size:11.5px;color:var(--dim);letter-spacing:.04em">Live MJPEG — streams connect automatically when visible</span>
+      <span style="font-size:11.5px;color:var(--dim);letter-spacing:.04em">Live MJPEG — streams connect automatically</span>
       <div class="spacer"></div>
       <button class="btn sm" id="feeds-refresh-btn">Reload</button>
+      <button class="btn primary sm" id="add-camera-btn">+ Add Camera</button>
     </div>
     <div class="scroll">
       <div class="feeds-grid" id="feeds-grid">
-        <div style="color:var(--muted);padding:40px;font-size:12px">Loading cameras…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ADD CAMERA MODAL -->
+  <div class="modal-overlay" id="add-cam-modal" style="display:none">
+    <div class="modal">
+      <div class="modal-title">Add Camera</div>
+      <div class="modal-field">
+        <label class="lbl">Source</label>
+        <input type="text" id="cam-source" placeholder="rtsp://host:554/... or path/to/video.mp4 or 0 (webcam)">
+        <div class="hint">RTSP URL, video file path, or webcam index (0, 1, ...)</div>
+      </div>
+      <div id="samples-area" style="display:none">
+        <label class="lbl" style="margin-bottom:4px">Quick Select — Sample Videos</label>
+        <div class="samples-quick" id="samples-list"></div>
+      </div>
+      <div class="modal-field" style="margin-top:14px">
+        <label class="lbl">Name (optional)</label>
+        <input type="text" id="cam-name" placeholder="e.g. Front Gate, NH48 Entry">
+      </div>
+      <div class="modal-row">
+        <div class="modal-field">
+          <label class="lbl">FPS Cap</label>
+          <input type="number" id="cam-fps" value="30" min="1" max="120" style="width:80px">
+        </div>
+        <div class="modal-toggle">
+          <label class="toggle-sw">
+            <input type="checkbox" id="cam-loop" checked>
+            <span class="toggle-track"></span>
+          </label>
+          <span class="lbl" style="margin-bottom:0">Loop Video</span>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="cam-cancel-btn">Cancel</button>
+        <button class="btn primary" id="cam-add-btn">Start Camera</button>
       </div>
     </div>
   </div>
@@ -920,6 +1154,82 @@ table.data-table .multi-cam td.cam-col { color: var(--med-t); font-weight: 600 }
     </div>
   </div>
 
+  <!-- PLATES (surveillance log) -->
+  <div class="pane" id="pane-plates">
+    <div class="data-pane">
+      <div class="sec-hdr">
+        <input type="text" id="plates-search" placeholder="Search plate text — e.g. AP09EA" style="width:240px;font-family:var(--mono);text-transform:uppercase">
+        <select id="plates-camera" style="width:140px"></select>
+        <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dim);cursor:pointer">
+          <input type="checkbox" id="plates-cross-only">
+          Cross-camera matches only
+        </label>
+        <div class="spacer"></div>
+        <span id="plates-meta" style="font-size:11px;color:var(--muted);font-family:var(--mono)"></span>
+        <button class="btn sm" id="plates-refresh-btn">Refresh</button>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th style="width:60px">Crop</th>
+            <th style="width:160px">Plate</th>
+            <th>Camera</th>
+            <th>Vehicle</th>
+            <th>OCR conf</th>
+            <th>Time</th>
+            <th style="width:120px">Match</th>
+          </tr>
+        </thead>
+        <tbody id="plates-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- FACES (violence incident captures + police-DB matches) -->
+  <div class="pane" id="pane-faces">
+    <div class="data-pane">
+      <div class="sec-hdr">
+        <select id="faces-filter" style="width:160px">
+          <option value="all">All captures</option>
+          <option value="matched">Matched only</option>
+        </select>
+        <select id="faces-risk" style="width:130px">
+          <option value="">All risks</option>
+          <option value="critical">Critical</option>
+          <option value="high">High</option>
+          <option value="medium">Medium</option>
+          <option value="low">Low</option>
+        </select>
+        <div class="spacer"></div>
+        <span id="faces-meta" style="font-size:11px;color:var(--muted);font-family:var(--mono)"></span>
+        <button class="btn sm" id="faces-refresh-btn">Refresh</button>
+      </div>
+      <div class="face-grid" id="face-grid"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Plate-history modal -->
+<div class="modal-back" id="plate-modal-back">
+  <div class="modal" id="plate-modal">
+    <div class="modal-hdr">
+      <span class="modal-title" id="plate-modal-title"></span>
+      <button class="btn-ghost" id="plate-modal-close">×</button>
+    </div>
+    <div class="modal-body" id="plate-modal-body"></div>
+  </div>
+</div>
+
+<!-- Face detail modal -->
+<div class="modal-back" id="face-modal-back">
+  <div class="modal" id="face-modal">
+    <div class="modal-hdr">
+      <span class="modal-title">Face Capture Detail</span>
+      <button class="btn-ghost" id="face-modal-close">×</button>
+    </div>
+    <div class="modal-body" id="face-modal-body"></div>
+  </div>
 </div>
 
 <div class="toast-area" id="toast-area"></div>
@@ -1036,9 +1346,233 @@ document.querySelectorAll('.tab').forEach(tab => {
     if(tab.dataset.tab==='incidents') loadIncidents();
     if(tab.dataset.tab==='crowd')     loadCrowd();
     if(tab.dataset.tab==='feeds')     loadFeeds();
+    if(tab.dataset.tab==='plates')    { _populatePlatesCameraDropdown(); loadPlates(); }
+    if(tab.dataset.tab==='faces')     loadFaces();
     if(tab.dataset.tab==='settings')  loadSettings();
   });
 });
+
+// ── Plates (surveillance log) ──────────────────────────
+async function loadPlates(){
+  const tbody = document.getElementById('plates-tbody');
+  tbody.innerHTML = '<tr class="empty-row"><td colspan="7"><div class="empty-state"><div class="empty-icon">···</div><div class="empty-title">Loading sightings</div></div></td></tr>';
+  const params = new URLSearchParams();
+  const search = document.getElementById('plates-search').value.trim().toUpperCase();
+  if(search) params.set('plate', search);
+  const cam = document.getElementById('plates-camera').value;
+  if(cam) params.set('camera_id', cam);
+  if(document.getElementById('plates-cross-only').checked) params.set('cross_camera_only', 'true');
+  params.set('limit', '50');   // lazy-load + smaller page = snappier UI
+  try {
+    const r = await api('/api/plates?' + params);
+    if(!r.ok){
+      tbody.innerHTML='<tr class="empty-row"><td colspan="7"><div class="empty-state"><div class="empty-icon">!</div><div class="empty-title">API error</div></div></td></tr>';
+      return;
+    }
+    const rows = await r.json();
+    document.getElementById('plates-meta').textContent = rows.length + ' sightings';
+    const cntEl = document.getElementById('tab-plates-cnt');
+    if(rows.length){ cntEl.textContent = rows.length > 99 ? '99+' : rows.length; cntEl.classList.add('vis'); }
+    else cntEl.classList.remove('vis');
+    if(!rows.length){
+      tbody.innerHTML = '<tr class="empty-row"><td colspan="7"><div class="empty-state"><div class="empty-icon">—</div><div class="empty-title">No plates seen yet</div><div class="empty-hint">Plates appear here as soon as the pipeline reads them.</div></div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(p => {
+      const ts = new Date(p.timestamp).toLocaleString();
+      const conf = (p.ocr_confidence*100).toFixed(0) + '%';
+      const veh = p.vehicle_class || '—';
+      const cropImg = p.plate_crop_path
+        ? `<img class="plate-thumb" loading="lazy" decoding="async" src="/api/evidence/${encodeURIComponent(p.plate_crop_path)}" alt="">`
+        : '<div class="plate-thumb"></div>';
+      const matchPill = p.is_cross_camera_match
+        ? '<span class="plate-match-pill">×-cam match</span>' : '';
+      return `<tr data-plate="${escHtml(p.plate_text)}" class="plate-row${p.is_cross_camera_match?' multi-cam':''}">
+        <td>${cropImg}</td>
+        <td class="mono">${escHtml(p.plate_text)}</td>
+        <td class="mono" style="color:var(--acc)">${escHtml(p.camera_id)}</td>
+        <td>${escHtml(veh)}</td>
+        <td>${conf}</td>
+        <td style="font-family:var(--mono);font-size:11px;color:var(--dim)">${ts}</td>
+        <td>${matchPill}</td>
+      </tr>`;
+    }).join('');
+    tbody.querySelectorAll('.plate-row').forEach(tr => {
+      tr.addEventListener('click', () => openPlateHistory(tr.dataset.plate));
+    });
+  } catch(e){
+    tbody.innerHTML='<tr class="empty-row"><td colspan="7"><div class="empty-state"><div class="empty-icon">×</div><div class="empty-title">Failed to load</div></div></td></tr>';
+  }
+}
+
+async function openPlateHistory(plate){
+  const back = document.getElementById('plate-modal-back');
+  const body = document.getElementById('plate-modal-body');
+  document.getElementById('plate-modal-title').textContent = plate;
+  body.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px">Loading…</div>';
+  back.classList.add('open');
+  try {
+    const r = await api('/api/plates/' + encodeURIComponent(plate) + '/history');
+    if(!r.ok){ body.innerHTML='<div style="color:var(--dim)">Failed</div>'; return; }
+    const d = await r.json();
+    let head = `<div style="font-family:var(--mono);font-size:12px;color:var(--dim);margin-bottom:14px">
+      <div><b style="color:var(--fg)">${d.total_sightings}</b> total sightings · seen on <b style="color:var(--acc)">${d.cameras_seen.length}</b> camera${d.cameras_seen.length!==1?'s':''}</div>
+      <div style="margin-top:4px">First: ${d.first_seen?new Date(d.first_seen).toLocaleString():'—'}</div>
+      <div>Last:  ${d.last_seen?new Date(d.last_seen).toLocaleString():'—'}</div>
+    </div>`;
+    body.innerHTML = head + d.sightings.map(s => `
+      <div class="timeline-row${s.is_cross_camera_match?' match':''}">
+        <div>${s.plate_crop_path?`<img class="plate-thumb" loading="lazy" decoding="async" src="/api/evidence/${encodeURIComponent(s.plate_crop_path)}" alt="">`:''}</div>
+        <div class="cam">${escHtml(s.camera_id)}</div>
+        <div>${s.vehicle_class||'—'} · OCR ${(s.ocr_confidence*100).toFixed(0)}%</div>
+        <div class="ts">${new Date(s.timestamp).toLocaleString()}</div>
+      </div>
+    `).join('');
+  } catch(_){ body.innerHTML='<div style="color:var(--dim)">Error</div>'; }
+}
+document.getElementById('plate-modal-close')?.addEventListener('click', () => {
+  document.getElementById('plate-modal-back').classList.remove('open');
+});
+document.getElementById('plate-modal-back')?.addEventListener('click', (e) => {
+  if(e.target.id === 'plate-modal-back') e.target.classList.remove('open');
+});
+document.getElementById('plates-refresh-btn')?.addEventListener('click', loadPlates);
+document.getElementById('plates-search')?.addEventListener('keypress', e => { if(e.key==='Enter') loadPlates(); });
+document.getElementById('plates-camera')?.addEventListener('change', loadPlates);
+document.getElementById('plates-cross-only')?.addEventListener('change', loadPlates);
+
+// ── Faces (violence captures + police-DB matches) ──────
+async function loadFaces(){
+  const grid = document.getElementById('face-grid');
+  grid.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:24px">Loading captures…</div>';
+  const params = new URLSearchParams();
+  if(document.getElementById('faces-filter').value === 'matched') params.set('matched_only', 'true');
+  const risk = document.getElementById('faces-risk').value;
+  if(risk) params.set('risk_level', risk);
+  params.set('limit', '120');
+  try {
+    const r = await api('/api/faces?' + params);
+    if(!r.ok){ grid.innerHTML='<div style="color:var(--dim)">API error</div>'; return; }
+    const rows = await r.json();
+    const matched = rows.filter(r => r.matched_record_id).length;
+    document.getElementById('faces-meta').textContent = `${rows.length} captures · ${matched} matched`;
+    const cntEl = document.getElementById('tab-faces-cnt');
+    if(matched){ cntEl.textContent = matched > 99 ? '99+' : matched; cntEl.classList.add('vis'); }
+    else cntEl.classList.remove('vis');
+    if(!rows.length){
+      grid.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:24px;grid-column:1/-1;text-align:center">No faces captured yet — faces are recorded during active violence incidents.</div>';
+      return;
+    }
+    grid.innerHTML = rows.map(f => {
+      const matched = !!f.matched_record_id;
+      const risk = (f.matched_risk_level || '').toLowerCase();
+      const cardClass = `face-card${matched?' matched':''}${risk?' '+risk:''}`;
+      const img = f.face_crop_path
+        ? `<img class="face-img" loading="lazy" decoding="async" src="/api/evidence/${encodeURIComponent(f.face_crop_path)}" alt="">`
+        : '<div class="face-img"></div>';
+      const pill = matched ? `<span class="face-risk-pill ${risk}">${risk||'match'}</span>` : '';
+      const name = matched
+        ? `<div class="face-name">${pill}${escHtml(f.matched_name)}</div>`
+        : '<div class="face-name unmatched">No match</div>';
+      const sim = f.match_similarity != null ? (f.match_similarity*100).toFixed(0)+'%' : '';
+      return `<div class="${cardClass}" data-id="${f.id}">
+        ${img}
+        <div class="face-meta">
+          ${name}
+          <div class="face-line2">
+            <span>${escHtml(f.camera_id)}</span>
+            <span>${sim}</span>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+    grid.querySelectorAll('.face-card').forEach(c => {
+      c.addEventListener('click', () => openFaceDetail(c.dataset.id));
+    });
+  } catch(_){ grid.innerHTML='<div style="color:var(--dim)">Error</div>'; }
+}
+
+async function openFaceDetail(id){
+  const back = document.getElementById('face-modal-back');
+  const body = document.getElementById('face-modal-body');
+  body.innerHTML = '<div style="color:var(--muted);text-align:center;padding:24px">Loading…</div>';
+  back.classList.add('open');
+  try {
+    const r = await api('/api/faces/' + id);
+    if(!r.ok){ body.innerHTML='<div style="color:var(--dim)">Failed</div>'; return; }
+    const f = await r.json();
+    const img = f.face_crop_path
+      ? `<img src="/api/evidence/${encodeURIComponent(f.face_crop_path)}" style="width:240px;height:240px;object-fit:cover;border:1px solid var(--bdr2);background:var(--s1)" alt="">`
+      : '';
+    const ts = new Date(f.timestamp).toLocaleString();
+    let matchBlock = '<div style="color:var(--dim);font-style:italic">No match in police DB</div>';
+    if(f.matched_record_id){
+      const sim = (f.match_similarity*100).toFixed(1)+'%';
+      const risk = (f.matched_risk_level||'').toLowerCase();
+      let policeRec = '';
+      try {
+        const pr = await api('/api/police-records/' + encodeURIComponent(f.matched_record_id));
+        if(pr.ok){
+          const p = await pr.json();
+          policeRec = `<div style="margin-top:14px;padding:12px;background:var(--s1);border:1px solid var(--bdr);border-radius:3px;font-family:var(--mono);font-size:11.5px;line-height:1.7">
+            <div><span style="color:var(--muted)">Age:</span> ${p.age}  ·  <span style="color:var(--muted)">Gender:</span> ${escHtml(p.gender)}</div>
+            <div><span style="color:var(--muted)">Last known:</span> ${escHtml(p.last_known_address||'—')}</div>
+            ${p.notes?`<div style="margin-top:6px;color:var(--fg)"><span style="color:var(--muted)">Notes:</span> ${escHtml(p.notes)}</div>`:''}
+          </div>`;
+        }
+      } catch(_){}
+      matchBlock = `
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+          <span class="face-risk-pill ${risk}">${risk||'match'}</span>
+          <span style="font-family:var(--mono);font-size:13px;font-weight:700;color:var(--fg)">${escHtml(f.matched_name)}</span>
+        </div>
+        <div style="font-family:var(--mono);font-size:12px;color:var(--dim)">
+          <div>ID: <span style="color:var(--acc)">${escHtml(f.matched_record_id)}</span> · Similarity: <b style="color:var(--fg)">${sim}</b></div>
+          <div style="margin-top:4px"><span style="color:var(--muted)">Charges:</span> ${escHtml(f.matched_charges||'—')}</div>
+        </div>
+        ${policeRec}`;
+    }
+    const incidentLink = f.incident_id
+      ? `<div style="margin-top:14px;font-size:11.5px;color:var(--dim)">From violence incident <a href="#" style="color:var(--acc);font-family:var(--mono)" onclick="document.querySelector('[data-tab=incidents]').click();return false">#${f.incident_id}</a></div>`
+      : '';
+    body.innerHTML = `
+      <div style="display:flex;gap:18px;align-items:flex-start">
+        <div>${img}</div>
+        <div style="flex:1;min-width:0">
+          ${matchBlock}
+          <div style="margin-top:14px;font-size:11.5px;color:var(--dim);font-family:var(--mono)">
+            <div>Camera: <span style="color:var(--acc)">${escHtml(f.camera_id)}</span></div>
+            <div>Captured: ${ts}</div>
+            <div>Quality: ${f.quality_score}</div>
+          </div>
+          ${incidentLink}
+        </div>
+      </div>`;
+  } catch(_){ body.innerHTML='<div style="color:var(--dim)">Error</div>'; }
+}
+document.getElementById('face-modal-close')?.addEventListener('click', () => {
+  document.getElementById('face-modal-back').classList.remove('open');
+});
+document.getElementById('face-modal-back')?.addEventListener('click', (e) => {
+  if(e.target.id === 'face-modal-back') e.target.classList.remove('open');
+});
+document.getElementById('faces-refresh-btn')?.addEventListener('click', loadFaces);
+document.getElementById('faces-filter')?.addEventListener('change', loadFaces);
+document.getElementById('faces-risk')?.addEventListener('change', loadFaces);
+
+// Populate plates camera dropdown when entering the tab
+async function _populatePlatesCameraDropdown(){
+  const sel = document.getElementById('plates-camera');
+  if(!sel || sel.dataset.populated) return;
+  try {
+    const r = await api('/api/cameras');
+    if(!r.ok) return;
+    const cams = await r.json();
+    sel.innerHTML = '<option value="">All cameras</option>' +
+      (cams.cameras||cams||[]).map(c => `<option value="${escHtml(c.id||c.camera_id)}">${escHtml(c.id||c.camera_id)}</option>`).join('');
+    sel.dataset.populated = '1';
+  } catch(_){}
+}
 
 // ── Stats ──────────────────────────────────────────────
 async function loadStats() {
@@ -1287,6 +1821,15 @@ function initWS() {
     if((msg.type==='stampede') && document.getElementById('pane-crowd').classList.contains('active')) {
       loadCrowd();
     }
+    if(msg.type==='plate_sighting' && document.getElementById('pane-plates').classList.contains('active')) {
+      loadPlates();
+    }
+    if(msg.type==='face_capture' && document.getElementById('pane-faces').classList.contains('active')) {
+      loadFaces();
+    }
+    if(msg.type==='safety_alert' && document.getElementById('pane-crowd').classList.contains('active')) {
+      loadCrowd();
+    }
   };
 }
 
@@ -1463,9 +2006,18 @@ function crowdCardHTML(c) {
   const ts = c.timestamp ? relTime(c.timestamp.replace('Z','')) : '—';
   const tsAbs = c.timestamp ? fmtTime(c.timestamp.replace('Z','')) : '';
 
+  const fruin = c.fruin_level || 'A';
+  const fruinColor = c.fruin_color || '#22c55e';
+  const fruinDesc = c.fruin_description || '';
+  const trend = c.density_trend_per_min || 0;
+  const trendArrow = trend > 0.1 ? '▲' : trend < -0.1 ? '▼' : '';
+  const trendStr = Math.abs(trend) > 0.05 ? `${trendArrow} ${Math.abs(trend).toFixed(1)} p/m²/min` : 'stable';
+  const activeAlerts = c.active_alerts || [];
+
   return `<div class="crowd-card level-${level}">
     <div class="crowd-hdr">
       <div class="crowd-cam">${escHtml(c.camera_id)}</div>
+      <span class="fruin-badge" style="background:${fruinColor}" title="${escHtml(fruinDesc)}">FRUIN ${fruin}</span>
       <span class="lvl-badge ${level}">${level}</span>
     </div>
     <div class="crowd-metrics">
@@ -1482,10 +2034,15 @@ function crowdCardHTML(c) {
         <div class="c-metric-lbl">Stampede Risk</div>
       </div>
       <div class="c-metric">
+        <div class="c-metric-val" style="font-size:13px;color:var(--dim)">${trendStr}</div>
+        <div class="c-metric-lbl">Trend</div>
+      </div>
+      <div class="c-metric">
         <div class="c-metric-val" style="font-size:14px"><span class="rel-ts" title="${tsAbs}">${ts}</span></div>
         <div class="c-metric-lbl">Updated</div>
       </div>
     </div>
+    ${activeAlerts.length ? `<div class="alert-strip">${activeAlerts.map(a=>`<div class="alert-row sev-${a.severity}"><b>${a.type.replace('_',' ').toUpperCase()}</b> ${escHtml(a.message)}</div>`).join('')}</div>` : ''}
     ${flags ? `<div class="flow-tags">${flags.split(', ').map(f=>`<span class="flow-tag">${escHtml(f)}</span>`).join('')}</div>` : ''}
     ${flowTags.length ? `<div class="flow-tags">${flowTags.map(t=>`<span class="flow-tag">${escHtml(t)}</span>`).join('')}</div>` : ''}
     ${zoneBars ? `<div class="zone-bars">${zoneBars}</div>` : ''}
@@ -1578,8 +2135,8 @@ async function loadSubjects() {
 
 document.getElementById('subjects-refresh-btn').addEventListener('click', loadSubjects);
 
-// ── Live Feeds (IntersectionObserver) ─────────────────
-const KNOWN_CAMS = ['CAM01','CAM02','CAM03'];
+// ── Live Feeds (dynamic camera management) ───────────
+let _samplesCache = null;
 
 function _disconnectFeeds() {
   document.querySelectorAll('.feed-img[data-src]').forEach(img => { img.src = ''; });
@@ -1587,11 +2144,27 @@ function _disconnectFeeds() {
 
 async function loadFeeds() {
   const grid = document.getElementById('feeds-grid');
-  let cams = [...KNOWN_CAMS];
+  let cams = [];
   try {
     const r = await api('/api/live/cameras');
-    if(r.ok){ const d = await r.json(); if(d.cameras?.length) cams = d.cameras; }
+    if(r.ok){ const d = await r.json(); cams = d.cameras || []; }
   } catch(_){}
+
+  if(!cams.length){
+    grid.innerHTML = `<div class="feeds-empty">
+      <div class="feeds-empty-icon">
+        <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+          <rect x="2" y="6" width="16" height="12" rx="1"/>
+          <path d="M18 10l4-2.5v9L18 14"/>
+          <line x1="6" y1="10" x2="10" y2="14" stroke-linecap="round"/>
+          <line x1="10" y1="10" x2="6" y2="14" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div class="feeds-empty-title">No cameras connected</div>
+      <div class="feeds-empty-sub">Click <strong>+ Add Camera</strong> above to connect a live camera, webcam, or load a sample video for testing.</div>
+    </div>`;
+    return;
+  }
 
   grid.innerHTML = cams.map(cid => `
     <div class="feed-card" id="feed-${cid}">
@@ -1600,6 +2173,7 @@ async function loadFeeds() {
         <span class="feed-cam-name">${escHtml(cid)}</span>
         <span class="feed-live-badge">LIVE</span>
       </div>
+      <button class="feed-remove-btn" data-cam="${cid}">✕ Remove</button>
       <img class="feed-img" id="feed-img-${cid}"
            data-src="/api/cameras/${cid}/mjpeg"
            alt="${escHtml(cid)}"
@@ -1609,6 +2183,20 @@ async function loadFeeds() {
         <div class="off-txt">Pipeline not running</div>
       </div>
     </div>`).join('');
+
+  // Attach remove handlers
+  document.querySelectorAll('.feed-remove-btn').forEach(btn => {
+    btn.addEventListener('click', async e => {
+      e.stopPropagation();
+      const cam = btn.dataset.cam;
+      if(!confirm(`Remove camera ${cam}?`)) return;
+      try {
+        const r = await api(`/api/cameras/${cam}`, {method:'DELETE'});
+        if(r.ok) { setTimeout(loadFeeds, 300); }
+        else { const err = await r.json(); alert(err.detail||'Error'); }
+      } catch(e) { alert('Failed to remove camera'); }
+    });
+  });
 
   if(_feedObserver) _feedObserver.disconnect();
   _feedObserver = new IntersectionObserver((entries) => {
@@ -1637,6 +2225,84 @@ async function loadFeeds() {
 document.getElementById('feeds-refresh-btn').addEventListener('click', () => {
   _disconnectFeeds();
   loadFeeds();
+});
+
+// ── Add Camera Modal ──────────────────────────────────
+const addCamModal = document.getElementById('add-cam-modal');
+
+document.getElementById('add-camera-btn').addEventListener('click', async () => {
+  addCamModal.style.display = 'flex';
+  document.getElementById('cam-source').value = '';
+  document.getElementById('cam-name').value = '';
+  document.getElementById('cam-fps').value = '30';
+  document.getElementById('cam-loop').checked = true;
+
+  // Load sample videos
+  const area = document.getElementById('samples-area');
+  const list = document.getElementById('samples-list');
+  if(!_samplesCache) {
+    try {
+      const r = await api('/api/cameras/samples');
+      if(r.ok) { _samplesCache = (await r.json()).samples || []; }
+      else { _samplesCache = []; }
+    } catch(_) { _samplesCache = []; }
+  }
+  if(_samplesCache.length > 0) {
+    area.style.display = 'block';
+    list.innerHTML = _samplesCache.map(s =>
+      `<div class="sample-chip" data-path="${escHtml(s.path)}" title="${s.size_mb} MB">${escHtml(s.filename)}</div>`
+    ).join('');
+    list.querySelectorAll('.sample-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        document.getElementById('cam-source').value = chip.dataset.path;
+        document.getElementById('cam-loop').checked = true;
+        const name = chip.textContent.replace(/\.[^.]+$/, '').replace(/[_-]/g, ' ');
+        if(!document.getElementById('cam-name').value) {
+          document.getElementById('cam-name').value = name;
+        }
+      });
+    });
+  } else {
+    area.style.display = 'none';
+  }
+});
+
+document.getElementById('cam-cancel-btn').addEventListener('click', () => {
+  addCamModal.style.display = 'none';
+});
+
+addCamModal.addEventListener('click', e => {
+  if(e.target === addCamModal) addCamModal.style.display = 'none';
+});
+
+document.getElementById('cam-add-btn').addEventListener('click', async () => {
+  const source = document.getElementById('cam-source').value.trim();
+  if(!source) { alert('Enter a source (URL, file path, or webcam index)'); return; }
+  const name = document.getElementById('cam-name').value.trim();
+  const fps  = parseInt(document.getElementById('cam-fps').value) || 30;
+  const loop = document.getElementById('cam-loop').checked;
+
+  const btn = document.getElementById('cam-add-btn');
+  btn.disabled = true; btn.textContent = 'Starting...';
+  try {
+    const r = await api('/api/cameras/add', {
+      method: 'POST',
+      body: JSON.stringify({ source, name, fps_cap: fps, loop }),
+    });
+    if(r.ok) {
+      const d = await r.json();
+      addCamModal.style.display = 'none';
+      // Wait a moment for stream to start producing frames
+      setTimeout(loadFeeds, 800);
+    } else {
+      const err = await r.json();
+      alert(err.detail || 'Failed to add camera');
+    }
+  } catch(e) {
+    alert('Network error adding camera');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Start Camera';
+  }
 });
 
 // ── Settings ───────────────────────────────────────────

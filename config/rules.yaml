@@ -17,13 +17,10 @@ alert_engine:
 # ---- Individual rules -------------------------------------------------------
 
 helmet:
-  enabled: true
-  # Min consecutive frames with no-helmet before rule fires.
-  # 10 frames @ 15fps = 0.67s — enough to reject brief occlusion.
+  # Disabled — surveillance system, not traffic enforcement.
+  enabled: false
   min_consecutive_no_helmet_frames: 10
-  # Minimum IoU between person box and 2-wheeler box to classify as a rider.
   rider_match_iou: 0.05
-  # Min confidence for the helmet detector (Indian helmets vary widely in shape).
   helmet_conf: 0.40
 
 red_light:
@@ -34,11 +31,13 @@ red_light:
   per_track_cooldown_seconds: 30
 
 plate_unreadable:
-  enabled: true
-  # Fire only when track has been visible this long AND no OCR clear.
-  min_track_frames: 25
-  # Ignore very small/distant plates — naturally unreadable.
-  min_plate_pixel_area: 800
+  # Disabled by default — was firing for every passing vehicle whose plate
+  # the OCR couldn't lock on (tiny / blurry / oblique angle). For real
+  # enforcement, plates are read passively and attached to OTHER violations
+  # (no_helmet, triple_riding, watchlist_hit) — not flagged on their own.
+  enabled: false
+  min_track_frames: 90              # 3 s at 30 fps — only long-visible vehicles
+  min_plate_pixel_area: 600
 
 wrong_way:
   enabled: false    # requires calibrated stop_line + direction per camera
@@ -48,7 +47,8 @@ wrong_way:
   per_track_cooldown_seconds: 45
 
 triple_riding:
-  enabled: true
+  # Disabled — surveillance focus, not traffic enforcement.
+  enabled: false
   min_rider_count: 3
   min_consecutive_frames: 6
   person_bike_overlap: 0.30
@@ -100,14 +100,41 @@ violence:
   enabled: true
   run_every_n_frames: 3
   kp_confidence: 0.40
-  # Wrist velocity: 12px/frame at 15fps = ~2m/s real-world → actual punch motion
-  wrist_velocity_threshold: 12.0   # was 8.0; reduced false +ves from gestures
-  # Proximity IoU: 0.08 — Indian crowds naturally stand closer together
-  proximity_iou: 0.08              # was 0.12; dense crowds make 0.12 too noisy
+  # Pose Stage-1 thresholds — kept conservative because Stage-1 is now ONLY
+  # a fast acceleration trigger; VideoMAE drives the actual incident state.
+  wrist_velocity_threshold: 12.0
+  proximity_iou: 0.08
   incident_cooldown_seconds: 60
-  # Stage-2 clip classifier (R3D-18, Apache 2.0, Kinetics-400 pretrained)
-  clip_model: "r3d_18"             # r3d_18 | mc3_18 | r2plus1d_18
-  clip_confirm_threshold: 0.55     # violence probability > this → confirmed active
+  # Stage-2: VideoMAE UCF-Crime (primary) — runs as the source of truth.
+  clip_model: "r3d_18"
+  # Threshold is applied to the SUM of violence-class probabilities. With the
+  # smarter scoring rule the system also fires when the top-1 is itself a
+  # violence class above 0.21, OR when any single violence class > 0.52.
+  clip_confirm_threshold: 0.35
+  # How often to poll VideoMAE when nothing has explicitly triggered it.
+  # 120 frames @ 30 fps = ~4 s — keeps GPU budget low when many cameras are
+  # running; CLIP per-frame catches brief actions in the meantime.
+  clip_poll_interval_frames: 120
+  # Treat the latest VideoMAE result as quiet after this many frames without
+  # a fresh positive — lets the IncidentManager auto-resolve.
+  clip_stale_after_frames: 180     # ~6 s
+
+  # ── CLIP zero-shot per-frame classifier ───────────────────────────────
+  # Replaces the old jaranohaal/RLVS ViT (which was unloadable on torch 2.5).
+  # Uses openai/clip-vit-base-patch32 with competing prompt sets:
+  #   violent: "two people fighting", "physical violence", ...
+  #   normal:  "cars driving on a road", "a normal street scene", ...
+  # Per-frame threshold = 0.55 (above this in window vote = confirmed)
+  # Strong threshold = 0.75 with normal_score < 0.25 = single-frame override
+  # Window of 8 frames, 4 must be positive for a confirmed call.
+  frame_per_frame_threshold: 0.55
+  frame_strong_threshold: 0.75
+  frame_strong_normal_max: 0.25
+  frame_window: 8
+  frame_min_positive: 4
+  # 12 frames @ 30 fps = 2.5 Hz CLIP — half the load of every-6-frames,
+  # still gets ≥4 verdicts in the 4-second decision window.
+  frame_run_every_n: 12
 
 # ---- Loitering detection — India-tuned ------------------------------------
 # Street vendors, tea stalls, autorickshaw drivers routinely sit for hours.
@@ -128,7 +155,8 @@ loitering:
 
 abandoned:
   enabled: true
-  min_frames: 300                  # ~20 s at 15fps; Indian street clutter is high
+  min_frames: 600                  # ~20 s at 30fps — Indian street clutter is high,
+                                   # require longer dwell to avoid parked-bag spam
   min_area_px2: 3000
   person_iou_threshold: 0.15
   owner_bind_radius_px: 200        # max pixels to bind owner at object first-sight

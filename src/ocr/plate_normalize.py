@@ -103,7 +103,152 @@ def normalize_indian_plate(raw: str) -> str | None:
                 return result
 
     # 5. Beam search over confusion candidates (catches multi-char OCR errors)
-    return _beam_search_normalize(s, beam_width=8)
+    bs = _beam_search_normalize(s, beam_width=8)
+    if bs:
+        return bs
+
+    # 6. State-code edit-distance correction (UNAMBIGUOUS only).
+    # If the first 2 characters look like a state code with a small OCR
+    # error and there is EXACTLY ONE valid state code at edit distance
+    # 1, correct it. If multiple states are equally close (e.g. XA is
+    # 1 hop from both KA and GA), do NOT auto-correct — leave the
+    # original text so the multi-frame consensus engine can decide
+    # via majority voting across many reads of the same vehicle.
+    if len(s) >= 8:
+        prefix = s[:2]
+        candidates_at_d1 = [
+            state for state in VALID_STATE_CODES
+            if state != prefix and _hamming_within_1(prefix, state)
+        ]
+        # ONE unambiguous candidate → apply it.
+        if len(candidates_at_d1) == 1:
+            fixed = candidates_at_d1[0] + s[2:]
+            result = _try_parse(fixed) or _try_corrected(fixed)
+            if result:
+                return result
+        # Multiple candidates → cross-reference with visually-likely OCR
+        # confusion pairs at position 0. K↔X, M↔N, S↔5, B↔8 etc. Only
+        # accept the candidate that's reachable through a documented
+        # confusion at exactly position 0, ignoring the rest.
+        elif len(candidates_at_d1) > 1:
+            for state in candidates_at_d1:
+                if _is_known_ocr_confusion(prefix[0], state[0]) and prefix[1] == state[1]:
+                    fixed = state + s[2:]
+                    result = _try_parse(fixed) or _try_corrected(fixed)
+                    if result:
+                        return result
+    return None
+
+
+# Symmetric letter-letter OCR confusions that fire at ANY position
+# inside the alphabetic portions of an Indian plate (positions 0-1 for
+# the state code and 4-5 for the series). Curated from PARSeq/ABINet
+# error tables. Used by `try_letter_substitutions` below.
+_OCR_LETTER_CONFUSIONS: dict[str, list[str]] = {
+    "M": ["N", "H", "W"],
+    "N": ["M", "H"],
+    "H": ["N", "M", "K"],
+    "K": ["X", "H", "R"],
+    "X": ["K"],
+    "B": ["R", "P", "8"],
+    "R": ["B", "P", "K"],
+    "P": ["R", "B", "F"],
+    "F": ["P", "E"],
+    "E": ["F", "B"],
+    "G": ["C", "Q", "6"],
+    "C": ["G", "Q"],
+    "Q": ["G", "C", "O"],
+    "O": ["Q", "D", "0"],
+    "D": ["O", "0"],
+    "U": ["V"],
+    "V": ["U", "Y"],
+    "Y": ["V", "T"],
+    "T": ["I", "Y"],
+    "I": ["T", "L", "1", "J"],
+    "L": ["I", "1"],
+    "J": ["I", "1"],
+    "S": ["5", "8"],
+    "Z": ["2"],
+}
+
+
+def try_letter_substitutions(text: str, max_subs: int = 1) -> list[str]:
+    """Generate variants of `text` by substituting confusable letters.
+
+    Used to recover from M↔N, H↔M and similar non-state-code mistakes.
+    Returns variants up to `max_subs` substitutions away. Only letter
+    positions are touched; digit positions are preserved.
+    """
+    variants = [text]
+    if max_subs <= 0:
+        return variants
+    out: list[str] = []
+    for v in variants:
+        for i, ch in enumerate(v):
+            if not ch.isalpha():
+                continue
+            for repl in _OCR_LETTER_CONFUSIONS.get(ch, ()):
+                out.append(v[:i] + repl + v[i+1:])
+    if max_subs > 1:
+        # 2-substitution variants
+        for v in list(out):
+            for i, ch in enumerate(v):
+                if not ch.isalpha():
+                    continue
+                for repl in _OCR_LETTER_CONFUSIONS.get(ch, ()):
+                    out.append(v[:i] + repl + v[i+1:])
+    # Dedupe, drop the input itself (caller already tried it)
+    seen = {text}
+    deduped = []
+    for v in out:
+        if v in seen:
+            continue
+        seen.add(v)
+        deduped.append(v)
+    return deduped
+
+
+# Known OCR confusion pairs at position 0 of an Indian plate. Curated
+# from common scene-text-recognition error tables (PARSeq, ABINet) plus
+# typical CCTV / fast-alpr failure modes on Indian fonts.
+_OCR_CONFUSION_AT_0: set[tuple[str, str]] = {
+    # X ↔ K — fast-alpr reads K's diagonal stroke as an X
+    ("X", "K"), ("K", "X"),
+    # M ↔ N — center-bar misses
+    ("M", "N"), ("N", "M"),
+    # B ↔ 8 / B ↔ R
+    ("B", "R"), ("R", "B"), ("B", "8"), ("8", "B"),
+    # T ↔ I when middle stroke faded
+    ("T", "I"), ("I", "T"),
+    # 0 ↔ O ↔ Q ↔ D
+    ("0", "O"), ("O", "0"), ("D", "0"), ("D", "O"), ("O", "D"),
+    # 5 ↔ S
+    ("S", "5"), ("5", "S"),
+    # 1 ↔ I ↔ L ↔ J
+    ("I", "1"), ("1", "I"), ("L", "I"), ("I", "L"), ("J", "I"),
+    # G ↔ C ↔ 6
+    ("G", "C"), ("C", "G"), ("G", "6"), ("6", "G"),
+    # 2 ↔ Z
+    ("Z", "2"), ("2", "Z"),
+    # H ↔ N (vertical bars only)
+    ("H", "N"), ("N", "H"),
+    # P ↔ R / P ↔ B
+    ("P", "R"), ("R", "P"), ("P", "B"), ("B", "P"),
+    # U ↔ V
+    ("U", "V"), ("V", "U"),
+}
+
+
+def _is_known_ocr_confusion(observed: str, candidate: str) -> bool:
+    return (observed, candidate) in _OCR_CONFUSION_AT_0
+
+
+def _hamming_within_1(a: str, b: str) -> bool:
+    """True iff strings of equal length differ by ≤ 1 character."""
+    if len(a) != len(b):
+        return False
+    diffs = sum(1 for x, y in zip(a, b) if x != y)
+    return diffs <= 1
 
 
 def _beam_search_normalize(s: str, beam_width: int = 8) -> str | None:
