@@ -1246,6 +1246,11 @@ let _wsRetry = 1000;
 let _sel     = new Set();
 let _expandedId = null;
 let _feedObserver = null;
+let _lastParams = '';
+const debouncedLoadStats = debounce(loadStats, 2000);
+const debouncedLoadPlates = debounce(loadPlates, 2000);
+const debouncedLoadFaces = debounce(loadFaces, 2000);
+const debouncedLoadCrowd = debounce(loadCrowd, 2000);
 
 const PRI = { watchlist_hit:'HIGH', wrong_way:'HIGH', red_light_jump:'HIGH',
               no_helmet:'MEDIUM', triple_riding:'MEDIUM', overspeed:'MEDIUM',
@@ -1355,7 +1360,7 @@ document.querySelectorAll('.tab').forEach(tab => {
 // ── Plates (surveillance log) ──────────────────────────
 async function loadPlates(){
   const tbody = document.getElementById('plates-tbody');
-  tbody.innerHTML = '<tr class="empty-row"><td colspan="7"><div class="empty-state"><div class="empty-icon">···</div><div class="empty-title">Loading sightings</div></div></td></tr>';
+  if(!tbody.querySelector('.plate-row')) tbody.innerHTML = '<tr class="empty-row"><td colspan="7"><div class="empty-state"><div class="empty-icon">···</div><div class="empty-title">Loading sightings</div></div></td></tr>';
   const params = new URLSearchParams();
   const search = document.getElementById('plates-search').value.trim().toUpperCase();
   if(search) params.set('plate', search);
@@ -1444,7 +1449,7 @@ document.getElementById('plates-cross-only')?.addEventListener('change', loadPla
 // ── Faces (violence captures + police-DB matches) ──────
 async function loadFaces(){
   const grid = document.getElementById('face-grid');
-  grid.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:24px">Loading captures…</div>';
+  if(!grid.querySelector('.face-card')) grid.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:24px">Loading captures…</div>';
   const params = new URLSearchParams();
   if(document.getElementById('faces-filter').value === 'matched') params.set('matched_only', 'true');
   const risk = document.getElementById('faces-risk').value;
@@ -1591,11 +1596,10 @@ async function loadStats() {
 }
 
 // ── Violations ─────────────────────────────────────────
-let _lastParams = '';
 
 async function loadViolations() {
   const tbody = document.getElementById('violations-body');
-  tbody.innerHTML = '<tr class="empty-row"><td colspan="9"><div class="empty-state"><div class="empty-icon">···</div><div class="empty-title">Loading</div></div></td></tr>';
+  if(!tbody.querySelector('.vrow')) tbody.innerHTML = '<tr class="empty-row"><td colspan="9"><div class="empty-state"><div class="empty-icon">···</div><div class="empty-title">Loading</div></div></td></tr>';
   document.getElementById('count-tag').style.display = 'none';
   _expandedId = null; _sel.clear();
   try {
@@ -1816,19 +1820,19 @@ function initWS() {
     showToast(msg);
     if(msg.type==='violation') {
       if(shouldShowEvent(msg)) prependRow(msg);
-      loadStats();
+      debouncedLoadStats();
     }
     if((msg.type==='stampede') && document.getElementById('pane-crowd').classList.contains('active')) {
-      loadCrowd();
+      debouncedLoadCrowd();
     }
     if(msg.type==='plate_sighting' && document.getElementById('pane-plates').classList.contains('active')) {
-      loadPlates();
+      debouncedLoadPlates();
     }
     if(msg.type==='face_capture' && document.getElementById('pane-faces').classList.contains('active')) {
-      loadFaces();
+      debouncedLoadFaces();
     }
     if(msg.type==='safety_alert' && document.getElementById('pane-crowd').classList.contains('active')) {
-      loadCrowd();
+      debouncedLoadCrowd();
     }
   };
 }
@@ -1896,7 +1900,7 @@ const ITYPE_LABELS = { violence:'Violence', loitering:'Loitering', abandoned:'Ab
 
 async function loadIncidents() {
   const tbody = document.getElementById('incidents-body');
-  tbody.innerHTML = '<tr class="empty-row"><td colspan="9"><div class="empty-state"><div class="empty-icon">···</div><div class="empty-title">Loading</div></div></td></tr>';
+  if(!tbody.querySelector('.vrow')) tbody.innerHTML = '<tr class="empty-row"><td colspan="9"><div class="empty-state"><div class="empty-icon">···</div><div class="empty-title">Loading</div></div></td></tr>';
   document.getElementById('incidents-count').style.display='none';
   try {
     const p = new URLSearchParams();
@@ -2204,17 +2208,21 @@ async function loadFeeds() {
       const img = entry.target.querySelector('.feed-img[data-src]');
       if(!img) return;
       if(entry.isIntersecting) {
-        if(!img.src || img.src === window.location.href) {
+        if(!img.hasAttribute('src') || img.src === window.location.href || img.src.endsWith('/')) {
+          img.style.display = '';
+          const errEl = document.getElementById('feed-err-'+entry.target.id.replace('feed-',''));
+          if(errEl) errEl.style.display = 'none';
+          entry.target.classList.remove('offline');
+          
           img.src = img.dataset.src;
           img.onerror = () => {
             img.style.display='none';
-            const errEl = document.getElementById('feed-err-'+entry.target.id.replace('feed-',''));
             if(errEl) errEl.style.display='flex';
             entry.target.classList.add('offline');
           };
         }
       } else {
-        img.src = '';
+        img.removeAttribute('src');
       }
     });
   }, { threshold: 0.1 });

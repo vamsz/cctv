@@ -19,12 +19,23 @@ def engine() -> Engine:
     if _engine is None:
         kwargs: dict = {"future": True, "pool_pre_ping": True}
         if settings.database_url.startswith("sqlite"):
-            kwargs["connect_args"] = {"check_same_thread": False}
+            kwargs["connect_args"] = {"check_same_thread": False, "timeout": 15}
         else:
             kwargs["pool_size"] = settings.database_pool_size
             kwargs["max_overflow"] = settings.database_max_overflow
             kwargs["pool_recycle"] = 1800
         _engine = create_engine(settings.database_url, **kwargs)
+        
+        if settings.database_url.startswith("sqlite"):
+            from sqlalchemy import event
+            @event.listens_for(_engine, "connect")
+            def set_sqlite_pragma(dbapi_connection, connection_record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.close()
+                
     return _engine
 
 

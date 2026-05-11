@@ -169,6 +169,9 @@ class CameraPipeline:
         face_detector=None,
         face_embedder=None,
         police_db=None,
+        clip_clf=None,
+        frame_clf=None,
+        dense_counter=None,
     ):
         self.spec = spec
         self.detector = detector
@@ -264,11 +267,7 @@ class CameraPipeline:
         )
         self.incident_mgr = IncidentManager(spec.id)
         # Stage-2 clip classifier — primary trigger, polled periodically
-        self._clip_clf = ViolenceClipClassifier(
-            device=settings.device,
-            threshold=float(violence_cfg.get("clip_confirm_threshold", 0.55)),
-            model_name=str(violence_cfg.get("clip_model", "r3d_18")),
-        )
+        self._clip_clf = clip_clf
         self._clip_confirmed: bool = False
         self._clip_score: float = 0.0
         self._clip_label: str = ""
@@ -286,15 +285,7 @@ class CameraPipeline:
         # CLIP zero-shot per-frame classifier — production frame-level
         # signal. Competes "violent fight" prompts against "cars on road"
         # / "normal scene" prompts so traffic footage doesn't fire.
-        self._frame_clf = FrameViolenceClassifier(
-            device=settings.device,
-            per_frame_threshold=float(violence_cfg.get("frame_per_frame_threshold", 0.55)),
-            strong_threshold=float(violence_cfg.get("frame_strong_threshold", 0.75)),
-            strong_normal_max=float(violence_cfg.get("frame_strong_normal_max", 0.25)),
-            window=int(violence_cfg.get("frame_window", 8)),
-            min_positive=int(violence_cfg.get("frame_min_positive", 4)),
-            run_every_n_frames=int(violence_cfg.get("frame_run_every_n", 6)),
-        )
+        self._frame_clf = frame_clf
 
         # ── Loitering ────────────────────────────────────────────────────
         loiter_cfg = rule_params.get("loitering", {})
@@ -319,11 +310,7 @@ class CameraPipeline:
         )
 
         # ── Dense crowd counter ───────────────────────────────────────────
-        crowd_cfg2 = rule_params.get("crowd", {})
-        self.dense_counter = DenseCrowdCounter(
-            dense_trigger_count=int(crowd_cfg2.get("dense_trigger_count", 30)),
-            device=settings.device,
-        )
+        self.dense_counter = dense_counter
 
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -1698,6 +1685,31 @@ class PipelineOrchestrator:
                 self.face_embedder = None
                 self.police_db = None
 
+        # ── Shared Heavy Models ──
+        self.clip_clf = None
+        self.frame_clf = None
+        if self.rule_params.get("violence", {}).get("enabled", True):
+            violence_cfg = self.rule_params.get("violence", {})
+            self.clip_clf = ViolenceClipClassifier(
+                device=settings.device,
+                threshold=float(violence_cfg.get("clip_confirm_threshold", 0.55)),
+                model_name=str(violence_cfg.get("clip_model", "r3d_18")),
+            )
+            self.frame_clf = FrameViolenceClassifier(
+                device=settings.device,
+                per_frame_threshold=float(violence_cfg.get("frame_per_frame_threshold", 0.55)),
+                strong_threshold=float(violence_cfg.get("frame_strong_threshold", 0.75)),
+                strong_normal_max=float(violence_cfg.get("frame_strong_normal_max", 0.25)),
+                window=int(violence_cfg.get("frame_window", 8)),
+                min_positive=int(violence_cfg.get("frame_min_positive", 4)),
+                run_every_n_frames=int(violence_cfg.get("frame_run_every_n", 6)),
+            )
+        
+        self.dense_counter = DenseCrowdCounter(
+            dense_trigger_count=int(self.rule_params.get("crowd", {}).get("dense_trigger_count", 30)),
+            device=settings.device,
+        )
+
         # Expose globally so API can call add/remove camera
         global _shared_orchestrator
         _shared_orchestrator = self
@@ -1768,6 +1780,9 @@ class PipelineOrchestrator:
                 face_detector=self.face_detector,
                 face_embedder=self.face_embedder,
                 police_db=self.police_db,
+                clip_clf=self.clip_clf,
+                frame_clf=self.frame_clf,
+                dense_counter=self.dense_counter,
             )
             # Override the stream config to support looping (with adaptive fps)
             from src.ingest.stream import StreamConfig

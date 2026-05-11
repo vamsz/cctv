@@ -51,6 +51,7 @@ DIGIT_TO_LETTER = str.maketrans({
 })
 
 OLD_FORMAT = re.compile(r"^([A-Z]{2})(\d{1,2})([A-Z]{1,3})(\d{1,4})$")
+PARTIAL_OLD_FORMAT = re.compile(r"^([A-Z]{1,2})(\d{1,2})([A-Z]{1,3})(\d{1,4})$")
 BH_FORMAT = re.compile(r"^(\d{2})BH(\d{4})([A-Z]{1,2})$")
 
 
@@ -169,6 +170,16 @@ _OCR_LETTER_CONFUSIONS: dict[str, list[str]] = {
     "J": ["I", "1"],
     "S": ["5", "8"],
     "Z": ["2"],
+    "0": ["O", "Q", "D"],
+    "1": ["I", "L", "J"],
+    "2": ["Z"],
+    "3": ["E"],
+    "4": ["A", "H"],
+    "5": ["S"],
+    "6": ["G", "C"],
+    "7": ["T", "Y"],
+    "8": ["B", "S"],
+    "9": ["P"],
 }
 
 
@@ -185,7 +196,7 @@ def try_letter_substitutions(text: str, max_subs: int = 1) -> list[str]:
     out: list[str] = []
     for v in variants:
         for i, ch in enumerate(v):
-            if not ch.isalpha():
+            if not ch.isalnum():
                 continue
             for repl in _OCR_LETTER_CONFUSIONS.get(ch, ()):
                 out.append(v[:i] + repl + v[i+1:])
@@ -193,7 +204,7 @@ def try_letter_substitutions(text: str, max_subs: int = 1) -> list[str]:
         # 2-substitution variants
         for v in list(out):
             for i, ch in enumerate(v):
-                if not ch.isalpha():
+                if not ch.isalnum():
                     continue
                 for repl in _OCR_LETTER_CONFUSIONS.get(ch, ()):
                     out.append(v[:i] + repl + v[i+1:])
@@ -317,10 +328,11 @@ def _try_parse(s: str) -> str | None:
 
 
 def _try_corrected(s: str) -> str | None:
-    if len(s) < 6:
+    if len(s) < 4:
         return None
 
     # --- Old format attempts ---
+    best_candidate = None
     for split in _candidate_splits_old(s):
         state_raw, rto_raw, series_raw, num_raw = split
         state = state_raw.translate(DIGIT_TO_LETTER)
@@ -328,8 +340,16 @@ def _try_corrected(s: str) -> str | None:
         series = series_raw.translate(DIGIT_TO_LETTER)
         num = num_raw.translate(LETTER_TO_DIGIT)
         candidate = f"{state}{rto}{series}{num}"
+        
         if OLD_FORMAT.match(candidate) and state in VALID_STATE_CODES:
             return candidate
+            
+        if PARTIAL_OLD_FORMAT.match(candidate):
+            if best_candidate is None:
+                best_candidate = candidate
+
+    if best_candidate:
+        return best_candidate
 
     # --- BH format attempts ---
     if len(s) >= 9:
@@ -356,20 +376,17 @@ def _try_corrected(s: str) -> str | None:
 
 def _candidate_splits_old(s: str):
     n = len(s)
-    # state always 2 chars, number always 3-4 digits at end
-    for num_len in (4, 3):
-        middle_len = n - 2 - num_len
-        if middle_len < 2 or middle_len > 5:
-            continue
-        for rto_len in (2, 1):
-            series_len = middle_len - rto_len
-            if 1 <= series_len <= 3:
-                yield (
-                    s[0:2],
-                    s[2:2 + rto_len],
-                    s[2 + rto_len:2 + rto_len + series_len],
-                    s[n - num_len:],
-                )
+    for num_len in range(1, 5):
+        for series_len in range(1, 4):
+            for rto_len in range(1, 3):
+                state_len = n - (num_len + series_len + rto_len)
+                if 1 <= state_len <= 2:
+                    yield (
+                        s[0:state_len],
+                        s[state_len:state_len + rto_len],
+                        s[state_len + rto_len:state_len + rto_len + series_len],
+                        s[n - num_len:],
+                    )
 
 
 # ---------------------------------------------------------------------------

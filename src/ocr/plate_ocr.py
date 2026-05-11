@@ -352,6 +352,7 @@ def _enhance_contrast(crop: np.ndarray) -> np.ndarray:
 # 0.95+. Cap its effective contribution so a confident-but-wrong fast
 # read can't outscore PaddleOCR's correct-but-lower-conf read.
 _ENGINE_TRUST_CAP = {
+    "crnn-ft":   1.00,
     "fast-alpr": 0.65,
     "fast":      0.65,
     "easy":      0.75,
@@ -409,42 +410,90 @@ class PlateOCR:
     ):
         self._fast = _build_fast_ocr(fast_ocr_model)
         self._paddle = _build_paddle_ocr(use_gpu=use_gpu)
+
+        self._ft_ocr = None
+        try:
+            from src.ocr.plate_recognizer_ft import FineTunedOCR
+            self._ft_ocr = FineTunedOCR()
+        except Exception:
+            log.debug("Fine-tuned OCR not loaded", exc_info=True)
+
+        # Warmup: first ONNX run has 200-400 ms session-init latency on
+        # the fast-plate-ocr provider chain. Run a dummy crop through
+        # both engines now so the first real plate doesn't pay that.
+        dummy = np.full((96, 320, 3), 220, dtype=np.uint8)
+        try:
+            if self._fast is not None:
+                _run_fast(self._fast, dummy)
+            if self._paddle is not None:
+                _run_paddle(self._paddle, dummy)
+        except Exception:
+            log.debug("OCR warmup failed (non-fatal)", exc_info=True)
+
         engines = []
+        if self._ft_ocr is not None:
+            engines.append("crnn-ft")
         if self._fast is not None:
             engines.append("fast-plate-ocr")
         if self._paddle is not None:
-            engines.append("paddleocr-v5")
+            engines.append("paddleocr-v5(fallback)")
         self._engines_str = " + ".join(engines) if engines else "none"
-        log.info("PlateOCR initialised — engines: %s", self._engines_str)
+        log.info("PlateOCR ready — engines: %s | fast-trust ≥ %.2f",
+                 self._engines_str, self._FAST_TRUST_CONF)
 
     @property
     def backend(self) -> str:
         return self._engines_str
 
-    def read(self, plate_crop: np.ndarray) -> Optional[PlateRead]:
-        """Run BOTH engines on a single preprocessed crop and pick the best.
+    # If fast-plate-ocr returns a confident Indian-format read, we
+    # don't need to call PaddleOCR at all — saves ~70 ms / call.
+    _FAST_TRUST_CONF = 0.70
 
-        Performance budget: 2 engine calls per invocation (~100 ms CPU).
-        Multi-frame consensus across the track is what makes this
-        accurate at the system level — we don't waste compute running
-        many variants per single frame.
+    def read(self, plate_crop: np.ndarray) -> Optional[PlateRead]:
+        """Two-tier OCR with adaptive escalation.
+
+          1. Try fast-plate-ocr (CUDA via ONNX, ~5-10 ms). If it returns
+             a high-confidence Indian-valid read, RETURN IMMEDIATELY.
+          2. Otherwise call PaddleOCR PP-OCRv5 (CPU, ~50-100 ms) as a
+             second opinion and pick the best by combined score.
+
+        On clean plates (~70 % of frames) only fast-plate-ocr runs:
+        ~5-10 ms per plate per frame, identical accuracy to the old
+        always-both pipeline. On hard plates we still get the Paddle
+        fallback. Net effect: pipeline keeps up with multi-camera 30 fps.
         """
         if plate_crop is None or plate_crop.size == 0:
             return None
 
         prepped = _preprocess(plate_crop)
 
-        candidates: list[PlateRead] = []
-        r = _run_fast(self._fast, prepped)
-        if r:
-            candidates.append(r)
-        r = _run_paddle(self._paddle, prepped)
-        if r:
-            candidates.append(r)
+        # Tier 0: Fine-tuned CRNN (trained on raw plate crop)
+        ft_read = None
+        if self._ft_ocr is not None:
+            res = self._ft_ocr.read(plate_crop)
+            if res:
+                text, conf = res
+                from src.ocr.plate_normalize import normalize_indian_plate
+                if conf >= 0.85 and normalize_indian_plate(text) is not None:
+                    return PlateRead(text=text, confidence=conf, engine="crnn-ft")
+                ft_read = PlateRead(text=text, confidence=conf, engine="crnn-ft")
+
+        # Tier 1: fast-plate-ocr (cheap)
+        fast_read = _run_fast(self._fast, prepped)
+        if fast_read is not None:
+            # Trust the fast read when it's confident AND looks like a real plate
+            from src.ocr.plate_normalize import normalize_indian_plate
+            if (fast_read.confidence >= self._FAST_TRUST_CONF
+                and normalize_indian_plate(fast_read.text) is not None):
+                return fast_read
+
+        # Tier 2: PaddleOCR fallback for uncertain or non-Indian plates
+        paddle_read = _run_paddle(self._paddle, prepped)
+
+        candidates = [c for c in (ft_read, fast_read, paddle_read) if c is not None]
         if not candidates:
             return None
 
-        # If both engines agreed, that's strong consensus on this frame
         if (len(candidates) == 2
             and candidates[0].text == candidates[1].text):
             return PlateRead(

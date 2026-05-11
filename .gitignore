@@ -30,3 +30,6 @@ data/helmet_combined/
 data/plate_ft/
 A-Dataset-for-Automatic-Violence-Detection-in-Videos-master/
 Drone_surv-main/
+kaggle_ocr/
+data/plate_ft
+data/plate_ocr_ft/
