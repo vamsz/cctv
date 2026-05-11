@@ -113,10 +113,17 @@ class ViolenceClipClassifier:
         """Add one frame to this camera's rolling buffer (called every pipeline frame)."""
         if not self._available:
             return
+        queued = frame
+        h, w = frame.shape[:2]
+        max_dim = max(h, w)
+        if max_dim > 384:
+            import cv2
+            scale = 384.0 / max_dim
+            queued = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         with self._buf_lock:
             if camera_id not in self._buffers:
                 self._buffers[camera_id] = deque(maxlen=self.BUFFER_LEN)
-            self._buffers[camera_id].append(frame.copy())
+            self._buffers[camera_id].append(queued.copy())
 
     def request_inference(
         self,

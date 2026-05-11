@@ -61,8 +61,12 @@ class YoloFaceDetector:
         self,
         device: str = "cpu",
         conf_threshold: float = 0.35,
-        min_side_px: int = 36,
-        min_quality: float = 18.0,
+        min_side_px: int = 24,
+        min_quality: float = 12.0,
+        enhance_crops: bool = True,
+        min_output_side: int = 160,
+        context_pad: float = 0.55,
+        max_upscale: float = 3.0,
         require_inside_person: bool = True,
     ):
         self.device = device
@@ -70,6 +74,10 @@ class YoloFaceDetector:
         self.min_side_px = min_side_px
         self.min_quality = min_quality
         self.require_inside_person = require_inside_person
+        self.enhance_crops = enhance_crops
+        self.min_output_side = min_output_side
+        self.context_pad = context_pad
+        self.max_upscale = max_upscale
         self._model = None
         self._available = _HF_HUB_AVAILABLE
         if not self._available:
@@ -145,16 +153,31 @@ class YoloFaceDetector:
                 if tid is None:
                     continue
 
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
+            tight_crop = frame[y1:y2, x1:x2]
+            if tight_crop.size == 0:
                 continue
-            quality = _laplacian_variance(crop)
+            quality = _laplacian_variance(tight_crop)
             if quality < self.min_quality:
                 continue
 
+            # Save a padded face/head crop rather than an aggressively zoomed
+            # tight face. Operators need context, and huge upscales turn
+            # 24px CCTV faces into unreadable blocky thumbnails.
+            cx1, cy1, cx2, cy2 = _expand_box(
+                (x1, y1, x2, y2), w, h, pad=self.context_pad,
+            )
+            crop = frame[cy1:cy2, cx1:cx2]
+            if crop.size == 0:
+                continue
+            enhanced = crop.copy()
+            if self.enhance_crops:
+                enhanced = _enhance_face_crop(
+                    enhanced, self.min_output_side, max_upscale=self.max_upscale,
+                )
+
             out.append(FaceCrop(
                 xyxy=(float(x1), float(y1), float(x2), float(y2)),
-                image=crop.copy(),
+                image=enhanced,
                 quality=float(quality),
                 person_track_id=tid,
                 detection_conf=float(conf),
@@ -182,3 +205,60 @@ def _laplacian_variance(img: np.ndarray) -> float:
     else:
         gray = img
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _expand_box(
+    box: tuple[int, int, int, int],
+    frame_w: int,
+    frame_h: int,
+    pad: float = 0.55,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = box
+    bw = max(1, x2 - x1)
+    bh = max(1, y2 - y1)
+    px = int(bw * pad)
+    py_top = int(bh * pad)
+    py_bottom = int(bh * pad * 1.4)
+    return (
+        max(0, x1 - px),
+        max(0, y1 - py_top),
+        min(frame_w, x2 + px),
+        min(frame_h, y2 + py_bottom),
+    )
+
+
+def _enhance_face_crop(
+    crop: np.ndarray,
+    min_output_side: int = 160,
+    max_upscale: float = 3.0,
+) -> np.ndarray:
+    """Upscale small faces and apply CLAHE to improve visibility.
+
+    CCTV faces are typically 30-60px tall — too small and dark for human
+    review or embedding models. This:
+      1. Upscales to at least `min_output_side` using bicubic interpolation
+      2. Applies CLAHE (Contrast Limited Adaptive Histogram Equalization)
+         to brighten dark faces without blowing out highlights
+      3. Applies a gentle unsharp mask to recover edge detail lost in upscale
+    """
+    h, w = crop.shape[:2]
+    # 1) Upscale if either dimension is below minimum
+    if h < min_output_side or w < min_output_side:
+        scale = min(max(min_output_side / h, min_output_side / w), max_upscale)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+
+    # 2) CLAHE on the L channel of LAB colour space
+    if crop.ndim == 3:
+        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        l_ch = clahe.apply(l_ch)
+        crop = cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+
+    # 3) Gentle unsharp mask — sharpen without amplifying noise
+    blurred = cv2.GaussianBlur(crop, (0, 0), sigmaX=2.0)
+    crop = cv2.addWeighted(crop, 1.3, blurred, -0.3, 0)
+
+    return crop

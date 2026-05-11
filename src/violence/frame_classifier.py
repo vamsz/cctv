@@ -30,6 +30,7 @@ References:
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -119,11 +120,18 @@ class FrameViolenceClassifier:
         self._text_features = None
         self._violent_count = len(VIOLENT_PROMPTS)
         self._lock = threading.Lock()
+        self._history_lock = threading.Lock()
+        self._queue: queue.Queue = queue.Queue(maxsize=4)
 
         self._history: dict[str, deque] = defaultdict(lambda: deque(maxlen=self._window))
         self._last_run_at: dict[str, int] = {}
 
         self._available = _CLIP_AVAILABLE
+        if self._available:
+            self._worker = threading.Thread(
+                target=self._worker_loop, daemon=True, name="violence-frame-worker"
+            )
+            self._worker.start()
         if not self._available:
             log.warning("transformers not installed — CLIP frame classifier disabled")
 
@@ -141,15 +149,21 @@ class FrameViolenceClassifier:
             return None
         self._last_run_at[camera_id] = frame_idx
         try:
-            verdict = self._infer(frame)
-        except Exception:
-            log.debug("CLIP frame inference failed", exc_info=True)
-            return None
-        self._history[camera_id].append(verdict)
-        return verdict
+            queued = frame
+            h, w = frame.shape[:2]
+            max_dim = max(h, w)
+            if max_dim > 640:
+                import cv2
+                scale = 640.0 / max_dim
+                queued = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+            self._queue.put_nowait((camera_id, queued.copy(), frame_idx))
+        except queue.Full:
+            pass
+        return None
 
     def is_confirmed(self, camera_id: str) -> bool:
-        hist = self._history.get(camera_id)
+        with self._history_lock:
+            hist = list(self._history.get(camera_id, []))
         if not hist:
             return False
         return sum(1 for v in hist if v.is_violent) >= self._min_positive
@@ -157,23 +171,41 @@ class FrameViolenceClassifier:
     def is_strong_violent(self, camera_id: str) -> bool:
         """Latest verdict is high violence AND low normal — used to bypass
         the 2-of-3 fusion rule when CLIP is highly confident on its own."""
-        hist = self._history.get(camera_id)
+        with self._history_lock:
+            hist = list(self._history.get(camera_id, []))
         if not hist:
             return False
         v = hist[-1]
         return v.score >= self._strong_threshold and v.normal_score <= self._strong_normal_max
 
     def latest_score(self, camera_id: str) -> float:
-        hist = self._history.get(camera_id)
+        with self._history_lock:
+            hist = list(self._history.get(camera_id, []))
         return hist[-1].score if hist else 0.0
 
     def latest_label(self, camera_id: str) -> str:
-        hist = self._history.get(camera_id)
+        with self._history_lock:
+            hist = list(self._history.get(camera_id, []))
         return hist[-1].label if hist else ""
 
     def reset(self, camera_id: str) -> None:
-        self._history.pop(camera_id, None)
+        with self._history_lock:
+            self._history.pop(camera_id, None)
         self._last_run_at.pop(camera_id, None)
+
+    def _worker_loop(self) -> None:
+        while True:
+            try:
+                camera_id, frame, _frame_idx = self._queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            try:
+                verdict = self._infer(frame)
+            except Exception:
+                log.debug("CLIP frame inference failed", exc_info=True)
+                continue
+            with self._history_lock:
+                self._history[camera_id].append(verdict)
 
     # ----------------------------------------------------------------
 

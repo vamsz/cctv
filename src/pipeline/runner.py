@@ -19,6 +19,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,7 +47,7 @@ from src.evidence.store import EvidenceStore
 from src.ingest.stream import StreamConfig, StreamReader
 from src.loitering.detector import AbandonedObjectDetector, LoiteringDetector
 from src.ocr.plate_normalize import normalize_plate
-from src.ocr.plate_ocr import PlateOCR
+from src.ocr.plate_ocr import PlateOCR, PlateRead
 from src.reid.matcher import CrossCameraReID
 from src.rules.alert_engine import AlertEngine
 from src.rules.engine import CameraGeometry, RulesEngine
@@ -188,7 +190,7 @@ class CameraPipeline:
         # within that incident gets up to `per_track_capacity` slots.
         from src.face.best_view import IncidentFaceBuffer
         self._face_buffers: dict[int, IncidentFaceBuffer] = {}
-        self._face_per_track_capacity = 3
+        self._face_per_track_capacity = 5
         self._face_total_capacity = settings.face_capture_max_per_incident
         self._last_face_scan_frame: int = -10_000
         # (incident_id, track_id_key) -> list of FaceCapture row ids
@@ -351,6 +353,24 @@ class CameraPipeline:
         self._latest_annotated: Optional[np.ndarray] = None
         self._latest_annotated_lock = threading.Lock()
 
+        # Slow refinement workers. The inference thread must stay free to
+        # consume the newest frame; CPU PaddleOCR, face embedding and DB work
+        # run here and are drained opportunistically by the next frame.
+        self._ocr_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(settings.ocr_async_workers)),
+            thread_name_prefix=f"ocr-{self.spec.id}",
+        )
+        self._ocr_pending: dict[int, Future] = {}
+        self._ocr_pending_meta: dict[int, tuple[int, tuple[float, float, float, float]]] = {}
+        self._ocr_ready: dict[int, list[tuple[PlateRead, int]]] = defaultdict(list)
+        self._ocr_lock = threading.Lock()
+
+        self._face_executor = ThreadPoolExecutor(
+            max_workers=max(1, int(settings.face_async_workers)),
+            thread_name_prefix=f"face-{self.spec.id}",
+        )
+        self._face_pending: set[Future] = set()
+
     def start(self) -> None:
         self.reader.start()
         # Stream thread: pushes every frame to MJPEG buffer at full speed
@@ -372,6 +392,8 @@ class CameraPipeline:
             self._thread.join(timeout=4.0)
         if self._stream_thread:
             self._stream_thread.join(timeout=2.0)
+        self._ocr_executor.shutdown(wait=False, cancel_futures=True)
+        self._face_executor.shutdown(wait=False, cancel_futures=True)
         self.reader.stop()
         # Clean up live frame buffer
         with _live_frame_lock:
@@ -388,7 +410,9 @@ class CameraPipeline:
         frames reclaims most of that for inference.
         """
         last_annotated_id = -1
+        last_push = 0.0
         while not self._stop.is_set():
+            now = time.monotonic()
             with self._latest_annotated_lock:
                 cached = self._latest_annotated
                 cached_id = id(cached) if cached is not None else -1
@@ -398,12 +422,23 @@ class CameraPipeline:
                 if cached_id != last_annotated_id:
                     update_live_frame(self.spec.id, cached, quality=60)
                     last_annotated_id = cached_id
+                    last_push = now
+                elif now - last_push >= 0.12:
+                    # Inference can be slower than the camera. Push a raw
+                    # fresh frame between annotated frames so the MJPEG view
+                    # keeps moving instead of looking frozen.
+                    packet = self.reader.read()
+                    if packet is not None:
+                        _, _, frame = packet
+                        update_live_frame(self.spec.id, frame, quality=50)
+                        last_push = now
             else:
                 # Cold-start fallback so the feed isn't black before first inference
                 packet = self.reader.read()
                 if packet is not None:
                     _, _, frame = packet
                     update_live_frame(self.spec.id, frame, quality=55)
+                    last_push = now
             # 40 ms = 25 fps MJPEG ceiling. With unchanged-frame skip this
             # is the *upper* bound on encoding work, not a steady rate.
             time.sleep(0.04)
@@ -430,7 +465,114 @@ class CameraPipeline:
             except Exception:
                 log.exception("[%s] frame %d failed", self.spec.id, frame_idx)
 
+    # ------------------------------------------- async OCR refinement
+
+    def _drain_async_ocr(self) -> None:
+        """Move completed OCR futures into a small per-track ready buffer."""
+        with self._ocr_lock:
+            items = list(self._ocr_pending.items())
+
+        for tid, fut in items:
+            if not fut.done():
+                continue
+            with self._ocr_lock:
+                meta = self._ocr_pending_meta.pop(tid, None)
+                self._ocr_pending.pop(tid, None)
+            try:
+                read = fut.result()
+            except Exception:
+                log.debug("[%s] async plate OCR failed for track %s", self.spec.id, tid, exc_info=True)
+                continue
+            if read is None:
+                continue
+            frame_idx = meta[0] if meta else self._latest_inference_frame_idx
+            with self._ocr_lock:
+                reads = self._ocr_ready[tid]
+                reads.append((read, frame_idx))
+                if len(reads) > 4:
+                    del reads[:-4]
+
+    def _take_async_ocr_reads(self, track_id: int) -> list[tuple[PlateRead, int]]:
+        with self._ocr_lock:
+            reads = self._ocr_ready.pop(track_id, [])
+        return reads
+
+    def _schedule_plate_ocr(
+        self,
+        track_id: int,
+        frame_idx: int,
+        frame: np.ndarray,
+        plate: Detection,
+        had_consensus: bool,
+    ) -> None:
+        """Submit slow OCR refinement without blocking the frame loop."""
+        interval = 45 if had_consensus else 8
+        last = self._track_last_ocr_frame.get(track_id, -10_000)
+        if (frame_idx - last) < interval:
+            return
+        with self._ocr_lock:
+            fut = self._ocr_pending.get(track_id)
+            if fut is not None and not fut.done():
+                return
+
+        crop = _crop_padded(frame, plate.xyxy, pad=0.25)
+        if crop is None or crop.size == 0:
+            return
+        self._track_last_ocr_frame[track_id] = frame_idx
+        fut = self._ocr_executor.submit(self.ocr.read, crop)
+        with self._ocr_lock:
+            self._ocr_pending[track_id] = fut
+            self._ocr_pending_meta[track_id] = (frame_idx, plate.xyxy)
+
+    def _apply_plate_candidates(
+        self,
+        td: TrackedDetection,
+        plate: Detection,
+        candidates: list[PlateRead],
+        frame_idx: int,
+        frame: np.ndarray,
+    ) -> None:
+        if not candidates:
+            return
+
+        from collections import Counter
+        from src.ocr.plate_ocr import _score as _plate_score
+
+        text_votes = Counter(c.text for c in candidates if c.text)
+        if not text_votes:
+            return
+
+        top_text, top_votes = text_votes.most_common(1)[0]
+        if top_votes >= 2:
+            voters = [c for c in candidates if c.text == top_text]
+            best = PlateRead(
+                text=top_text,
+                confidence=min(0.99, max(v.confidence for v in voters) + 0.05 * top_votes),
+                engine=f"consensus({top_votes})",
+            )
+            self._track_consensus_plate[td.track_id] = best.text
+        else:
+            best = max(candidates, key=_plate_score)
+
+        stored = normalize_plate(best.text) or best.text.strip()
+        if not stored:
+            return
+
+        self._plate_consensus.submit(
+            td.track_id, stored, float(best.confidence), frame_idx,
+        )
+        consensus_text, consensus_conf = self._plate_consensus.consensus(td.track_id)
+        if consensus_text and consensus_conf > 0:
+            final_text, final_conf = consensus_text, consensus_conf
+        else:
+            final_text, final_conf = stored, float(best.confidence)
+
+        self.rules.attach_plate_read(td.track_id, final_text, final_conf)
+        self._log_plate_sighting(td, plate, final_text, float(final_conf), frame)
+
     def _process_frame(self, frame_idx: int, ts: float, frame: np.ndarray) -> None:
+        self._latest_inference_frame_idx = frame_idx
+        self._drain_async_ocr()
         bundle = self.detector(frame, frame_idx, ts)
         tracked = self.tracker.update(bundle)
 
@@ -508,7 +650,6 @@ class CameraPipeline:
             # produced ~30 % wrong-text reads on Indian / oblique plates
             # because fast-alpr's mobile-vit-v2 model is not tuned for
             # Indian fonts.
-            from src.ocr.plate_ocr import PlateRead, _score as _plate_score
             candidates: list[PlateRead] = []
 
             # Candidate 1 — fast-alpr's pre-read (only if non-trivial text)
@@ -521,14 +662,20 @@ class CameraPipeline:
                         engine="fast-alpr",
                     ))
 
+            for async_read, async_frame_idx in self._take_async_ocr_reads(td.track_id):
+                candidates.append(async_read)
+                frame_idx = max(frame_idx, async_frame_idx)
+
             # PaddleOCR is expensive (~50-100 ms CPU per crop). Skip only
             # when this track has already produced a CONSENSUS read
             # (engines agreed) — fast-alpr's "high confidence" alone is
             # not a reliable trust signal. Re-run every 60 frames as a
             # sanity check in case the angle improved.
             had_consensus = self._track_consensus_plate.get(td.track_id) is not None
-            re_ocr_due = (frame_idx - self._track_last_ocr_frame.get(td.track_id, -1000)) >= 30
-            if (not had_consensus) or re_ocr_due:
+            self._schedule_plate_ocr(td.track_id, frame_idx, frame, plate, had_consensus)
+            self._apply_plate_candidates(td, plate, candidates, frame_idx, frame)
+            continue
+            if False:
                 # ONE Paddle call per frame at the 25%-padded crop.
                 # Multi-frame consensus across ~10 frames per track
                 # gives us the same accuracy as multi-variant ensemble
@@ -985,7 +1132,13 @@ class CameraPipeline:
             if not kept:
                 continue
             # Either a fresh slot or a replaced one — persist accordingly.
-            self._persist_face_capture(incident_id, cand, tid_key, evicted)
+            self._face_pending = {fut for fut in self._face_pending if not fut.done()}
+            if len(self._face_pending) >= max(2, settings.face_async_workers * 4):
+                continue
+            fut = self._face_executor.submit(
+                self._persist_face_capture, incident_id, cand, tid_key, evicted,
+            )
+            self._face_pending.add(fut)
 
     def _persist_face_capture(
         self,
@@ -1397,14 +1550,15 @@ class CameraPipeline:
         except Exception:
             frame_idx_now = 0
         last_update_frame = self._track_last_sight_update_frame.get(td.track_id, -10000)
-        if (existing_id is not None
-            and not text_changed
-            and (frame_idx_now - last_update_frame) < 30):
+        update_gap = frame_idx_now - last_update_frame
+        min_update_gap = 10 if text_changed else 30
+        if existing_id is not None and update_gap < min_update_gap:
             return
         self._track_last_sight_update_frame[td.track_id] = frame_idx_now
 
         plate_crop_path = None
-        if text_changed or existing_id is None:
+        should_refresh_crop = existing_id is None or (text_changed and update_gap >= 30)
+        if should_refresh_crop:
             try:
                 # Save the WIDER padded crop (40 % around the bbox) so the
                 # operator can verify the read by eye in the UI. The tight
@@ -1587,11 +1741,18 @@ class PipelineOrchestrator:
     def __init__(self):
         import os
         import torch
-        # Use all available CPU threads for data-parallel operations (OCR, pre/post-process).
+        # Keep Torch's CPU pools modest. CUDA inference mostly needs CPU for
+        # pre/post-processing; letting every model own all 20 logical cores
+        # starves capture, OCR workers and the FastAPI event loop.
         cpu_count = os.cpu_count() or 4
-        torch.set_num_threads(cpu_count)
-        torch.set_num_interop_threads(max(2, cpu_count // 2))
-        log.info("CPU parallelism: %d inference threads, %d interop threads", cpu_count, max(2, cpu_count // 2))
+        torch_threads = max(1, min(settings.torch_worker_threads, cpu_count))
+        interop_threads = max(1, min(settings.torch_interop_threads, torch_threads))
+        torch.set_num_threads(torch_threads)
+        torch.set_num_interop_threads(interop_threads)
+        log.info(
+            "CPU parallelism: torch=%d interop=%d (system cores=%d)",
+            torch_threads, interop_threads, cpu_count,
+        )
 
         if torch.cuda.is_available():
             # Allow PyTorch to overlap CPU↔GPU transfers with compute

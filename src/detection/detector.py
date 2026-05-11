@@ -260,7 +260,14 @@ class Detector:
         bundle = DetectionBundle(frame_idx=frame_idx, timestamp=timestamp)
 
         # --- general model ---
-        res = self.general.predict(frame, device=self.device, conf=self.conf, verbose=False, half=self._half)[0]
+        res = self.general.predict(
+            frame,
+            device=self.device,
+            conf=self.conf,
+            classes=list(COCO_TO_CLASS.keys()),
+            verbose=False,
+            half=self._half,
+        )[0]
         if res.boxes is not None and len(res.boxes) > 0:
             xyxy = res.boxes.xyxy.cpu().numpy()
             confs = res.boxes.conf.cpu().numpy()

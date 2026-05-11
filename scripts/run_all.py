@@ -14,14 +14,19 @@ import os
 # ── Performance + log-noise environment (must be set BEFORE any import that
 # triggers numpy / torch / onnxruntime / opencv) ──────────────────────────
 _cpu_count = os.cpu_count() or 8
+_cpu_workers = int(os.getenv("CCTV_CPU_THREADS", str(min(8, max(4, _cpu_count // 2)))))
+_cv_workers = int(os.getenv("CCTV_CV_THREADS", str(min(4, max(2, _cpu_workers // 2)))))
 
-# Use ALL physical+logical cores for every BLAS / OpenMP / OpenCV worker.
-# i9-12700H = 14 cores / 20 threads; we set 20.
-os.environ.setdefault("OMP_NUM_THREADS",          str(_cpu_count))
-os.environ.setdefault("MKL_NUM_THREADS",          str(_cpu_count))
-os.environ.setdefault("OPENBLAS_NUM_THREADS",     str(_cpu_count))
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS",   str(_cpu_count))
-os.environ.setdefault("NUMEXPR_NUM_THREADS",      str(_cpu_count))
+# Keep native libraries from oversubscribing the CPU. Giving OpenCV,
+# PaddleOCR, NumExpr, MKL and Torch 20 threads each makes the UI hang while
+# the OS context-switches. These defaults leave cores free for capture,
+# websocket, DB and background OCR workers.
+os.environ.setdefault("OMP_NUM_THREADS",          str(_cpu_workers))
+os.environ.setdefault("MKL_NUM_THREADS",          str(_cpu_workers))
+os.environ.setdefault("OPENBLAS_NUM_THREADS",     str(_cpu_workers))
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS",   str(_cpu_workers))
+os.environ.setdefault("NUMEXPR_MAX_THREADS",      str(max(_cpu_workers, 8)))
+os.environ.setdefault("NUMEXPR_NUM_THREADS",      str(min(_cpu_workers, int(os.environ["NUMEXPR_MAX_THREADS"]))))
 # torch's intra-op pool — runner overrides this further but the env var
 # affects threads created BEFORE the runner can set them.
 os.environ.setdefault("OMP_DYNAMIC", "FALSE")
@@ -64,7 +69,7 @@ log = logging.getLogger("run_all")
 # Configure OpenCV to use every core. Must come AFTER the env var setup
 # so the OpenCV worker pool sizes itself correctly.
 import cv2  # noqa: E402
-cv2.setNumThreads(_cpu_count)
+cv2.setNumThreads(_cv_workers)
 cv2.setUseOptimized(True)
 log.info("OpenCV threads: %d (optimised=%s)", cv2.getNumThreads(), cv2.useOptimized())
 
@@ -75,7 +80,10 @@ import uvicorn  # noqa: E402
 if __name__ == "__main__":
     log.info("=" * 60)
     log.info("CCTV Enforcement System starting up")
-    log.info("Device: %s | CPU cores: %d", settings.device, _cpu_count)
+    log.info(
+        "Device: %s | CPU cores: %d | native workers=%d cv=%d",
+        settings.device, _cpu_count, _cpu_workers, _cv_workers,
+    )
     log.info("=" * 60)
 
     orch = PipelineOrchestrator()

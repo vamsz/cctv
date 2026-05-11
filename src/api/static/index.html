@@ -479,7 +479,7 @@ select { cursor: pointer; appearance: none; padding-right: 24px;
 .face-card.matched.critical { border-color: #ff4646 }
 .face-card.matched.high { border-color: #ff7a1c }
 .face-card .face-img {
-  width: 100%; aspect-ratio: 1/1; object-fit: cover;
+  width: 100%; aspect-ratio: 1/1; object-fit: contain;
   background: var(--s1);
   display: block;
 }
@@ -1507,7 +1507,7 @@ async function openFaceDetail(id){
     if(!r.ok){ body.innerHTML='<div style="color:var(--dim)">Failed</div>'; return; }
     const f = await r.json();
     const img = f.face_crop_path
-      ? `<img src="/api/evidence/${encodeURIComponent(f.face_crop_path)}" style="width:240px;height:240px;object-fit:cover;border:1px solid var(--bdr2);background:var(--s1)" alt="">`
+      ? `<img src="/api/evidence/${encodeURIComponent(f.face_crop_path)}" style="width:240px;height:240px;object-fit:contain;border:1px solid var(--bdr2);background:var(--s1)" alt="">`
       : '';
     const ts = new Date(f.timestamp).toLocaleString();
     let matchBlock = '<div style="color:var(--dim);font-style:italic">No match in police DB</div>';

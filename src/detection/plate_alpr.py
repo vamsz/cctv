@@ -26,6 +26,31 @@ except ImportError:
     pass
 
 
+def _ort_providers(device: str):
+    try:
+        import onnxruntime as ort
+        available = set(ort.get_available_providers())
+    except Exception:
+        available = set()
+    providers = []
+    if device.startswith("cuda") and "CUDAExecutionProvider" in available:
+        providers.append("CUDAExecutionProvider")
+    providers.append("CPUExecutionProvider")
+    return providers
+
+
+def _ort_session_options():
+    try:
+        import onnxruntime as ort
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return opts
+    except Exception:
+        return None
+
+
 def _bbox_to_xyxy(bbox) -> tuple[float, float, float, float]:
     """Normalise any bounding-box format from fast-alpr to (x1,y1,x2,y2)."""
     # BoundingBox dataclass with x1/y1/x2/y2 attributes
@@ -69,9 +94,17 @@ class ALPRDetector:
             return
         try:
             # fast-alpr auto-downloads ONNX weights on first use
+            providers = _ort_providers(device)
+            sess_options = _ort_session_options()
             self._alpr = _FastALPR(
                 detector_model=detector_model,
+                detector_conf_thresh=conf,
+                detector_providers=providers,
+                detector_sess_options=sess_options,
                 ocr_model=ocr_model,
+                ocr_device="cuda" if device.startswith("cuda") else "cpu",
+                ocr_providers=providers,
+                ocr_sess_options=sess_options,
             )
             log.info("fast-alpr loaded: detector=%s  ocr=%s", detector_model, ocr_model)
         except Exception:

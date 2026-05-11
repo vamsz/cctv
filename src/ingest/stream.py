@@ -71,6 +71,10 @@ class StreamReader:
             return False
         # Keep buffer minimal so we always read the freshest frame.
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        try:
+            cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+        except Exception:
+            pass
         self._cap = cap
         return True
 
@@ -103,6 +107,7 @@ class StreamReader:
 
             now = time.time()
             if now - last_emit < self._fps_interval:
+                time.sleep(min(self._fps_interval - (now - last_emit), 0.005))
                 continue
             last_emit = now
 

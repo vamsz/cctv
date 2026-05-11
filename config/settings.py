@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     max_fps: int = 15
     det_conf: float = 0.35
     ocr_auto_accept: float = 0.45
+    cpu_worker_threads: int = 6
+    cv_worker_threads: int = 3
+    torch_worker_threads: int = 4
+    torch_interop_threads: int = 2
+    ocr_async_workers: int = 1
+    face_async_workers: int = 1
 
     # auth
     jwt_secret: SecretStr = SecretStr("dev-only-not-for-production")
@@ -108,8 +114,8 @@ class Settings(BaseSettings):
 
     # face capture for violence incidents
     police_match_threshold: float = 0.55         # cosine similarity for "match"
-    face_capture_every_n_frames: int = 15        # 1 face capture pass per ~0.5s at 30fps
-    face_capture_max_per_incident: int = 8       # cap to avoid overwhelming the operator
+    face_capture_every_n_frames: int = 8         # 1 face capture pass per ~0.27s at 30fps
+    face_capture_max_per_incident: int = 12      # cap to avoid overwhelming the operator
 
     # plate detection
     sahi_plate_enabled: bool = False     # sliced plate inference (adds ~10ms per frame)

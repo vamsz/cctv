@@ -33,6 +33,7 @@ Sources:
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -51,6 +52,31 @@ class PlateRead:
     engine: str = ""    # "fast" | "paddle" | "easy" | "consensus"
 
 
+def _ort_providers(use_gpu: bool = True):
+    try:
+        import onnxruntime as ort
+        available = set(ort.get_available_providers())
+    except Exception:
+        available = set()
+    providers = []
+    if use_gpu and "CUDAExecutionProvider" in available:
+        providers.append("CUDAExecutionProvider")
+    providers.append("CPUExecutionProvider")
+    return providers
+
+
+def _ort_session_options():
+    try:
+        import onnxruntime as ort
+        opts = ort.SessionOptions()
+        opts.intra_op_num_threads = 1
+        opts.inter_op_num_threads = 1
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return opts
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Engine 1 — fast-plate-ocr (ONNX, milliseconds)
 # ---------------------------------------------------------------------------
@@ -61,7 +87,12 @@ def _build_fast_ocr(model_name: str = "global-plates-mobile-vit-v2-model"):
             from fast_plate_ocr import LicensePlateRecognizer as _Rec
         except ImportError:
             from fast_plate_ocr import ONNXPlateRecognizer as _Rec   # type: ignore[no-redef]
-        reader = _Rec(hub_ocr_model=model_name)
+        reader = _Rec(
+            hub_ocr_model=model_name,
+            device="cuda" if "CUDAExecutionProvider" in _ort_providers(True) else "cpu",
+            providers=_ort_providers(True),
+            sess_options=_ort_session_options(),
+        )
         log.info("OCR engine: fast-plate-ocr (%s) loaded", model_name)
         return reader
     except Exception:
@@ -410,6 +441,7 @@ class PlateOCR:
     ):
         self._fast = _build_fast_ocr(fast_ocr_model)
         self._paddle = _build_paddle_ocr(use_gpu=use_gpu)
+        self._lock = threading.Lock()
 
         self._ft_ocr = None
         try:
@@ -464,6 +496,14 @@ class PlateOCR:
         """
         if plate_crop is None or plate_crop.size == 0:
             return None
+
+        with self._lock:
+            return self._read_locked(plate_crop)
+
+    def _read_locked(self, plate_crop: np.ndarray) -> Optional[PlateRead]:
+        """Run OCR engines under one lock; PaddleOCR/ONNX sessions are not
+        reliably thread-safe on Windows when shared across camera workers.
+        """
 
         prepped = _preprocess(plate_crop)
 

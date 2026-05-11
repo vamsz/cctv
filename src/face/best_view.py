@@ -52,7 +52,7 @@ class CandidateFace:
     db_id: Optional[int] = None
 
 
-_HARD_REJECT_BELOW = 0.18    # below this combined score the face is unusable
+_HARD_REJECT_BELOW = 0.12    # below this combined score the face is unusable
 
 
 def score_face(
