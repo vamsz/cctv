@@ -425,6 +425,59 @@ select { cursor: pointer; appearance: none; padding-right: 24px;
 ═══════════════════════════════════════════════ */
 .data-pane { padding: 16px; overflow-y: auto; flex: 1 }
 
+/* ── Plate detail modal ─────────────────────────── */
+.pd-overlay {
+  display: none; position: fixed; inset: 0; z-index: 900;
+  background: rgba(0,0,0,.65); backdrop-filter: blur(3px);
+  align-items: flex-start; justify-content: center; padding-top: 60px;
+}
+.pd-overlay.open { display: flex; }
+.pd-modal {
+  background: var(--s1); border: 1px solid var(--border);
+  border-radius: 10px; width: 680px; max-width: 96vw;
+  max-height: 80vh; display: flex; flex-direction: column;
+  box-shadow: 0 24px 60px rgba(0,0,0,.55);
+}
+.pd-header {
+  display: flex; align-items: center; gap: 12px;
+  padding: 16px 20px 12px; border-bottom: 1px solid var(--border);
+}
+.pd-plate-text {
+  font-family: var(--mono); font-size: 22px; font-weight: 700;
+  letter-spacing: .08em; color: var(--acc); flex: 1;
+}
+.pd-close {
+  background: none; border: none; color: var(--muted);
+  font-size: 20px; cursor: pointer; padding: 4px 8px; border-radius: 4px;
+}
+.pd-close:hover { color: var(--fg); background: var(--s2); }
+.pd-meta {
+  display: flex; gap: 24px; padding: 12px 20px;
+  border-bottom: 1px solid var(--border); flex-wrap: wrap;
+}
+.pd-meta-item { display: flex; flex-direction: column; gap: 2px; }
+.pd-meta-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+.pd-meta-val { font-size: 13px; font-weight: 600; color: var(--fg); font-family: var(--mono); }
+.pd-body { overflow-y: auto; flex: 1; padding: 12px 20px 20px; }
+.pd-sighting {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 0; border-bottom: 1px solid var(--border);
+}
+.pd-sighting:last-child { border-bottom: none; }
+.pd-sighting-crop { width: 90px; height: 36px; object-fit: cover; border-radius: 3px; background: var(--s2); flex-shrink: 0; }
+.pd-sighting-crop-ph { width: 90px; height: 36px; background: var(--s2); border-radius: 3px; flex-shrink: 0; }
+.pd-cam-badge {
+  font-family: var(--mono); font-size: 10px; font-weight: 700;
+  padding: 2px 6px; background: var(--s2); border-radius: 3px;
+  color: var(--acc); border: 1px solid var(--border); flex-shrink: 0;
+}
+.pd-cross { color: var(--hi-t); font-size: 10px; font-weight: 700; }
+.wl-plate-link {
+  color: var(--acc); cursor: pointer; font-family: var(--mono);
+  text-decoration: underline dotted; text-underline-offset: 3px;
+}
+.wl-plate-link:hover { color: var(--fg); }
+
 /* Fruin Level-of-Service badge */
 .fruin-badge {
   display: inline-block;
@@ -570,7 +623,7 @@ table.data-table .multi-cam td.cam-col { color: var(--med-t); font-weight: 600 }
   font-size: 8.5px; background: var(--hi); color: #fff; padding: 1px 5px;
   font-weight: 700; letter-spacing: .08em; font-family: var(--mono);
 }
-.feed-img { width: 100%; height: 100%; object-fit: cover; display: block }
+.feed-img { width: 100%; height: 100%; display: block; object-fit: cover }
 .feed-offline-msg {
   position: absolute; inset: 0; display: none; align-items: center;
   justify-content: center; flex-direction: column; gap: 8px; color: var(--muted);
@@ -592,6 +645,24 @@ table.data-table .multi-cam td.cam-col { color: var(--med-t); font-weight: 600 }
 .feeds-empty-icon { font-size: 32px; color: var(--muted); opacity: .4 }
 .feeds-empty-title { font-size: 14px; font-weight: 600; color: var(--dim) }
 .feeds-empty-sub { font-size: 12px; color: var(--muted); text-align: center; max-width: 400px; line-height: 1.6 }
+
+/* ─── Live plate strip ─────────────────────────── */
+.lp-strip { padding: 0 16px 16px; display: none }
+.lp-hdr { font-size: 9px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; display: flex; align-items: center; gap: 8px }
+.lp-list { display: flex; gap: 8px; flex-wrap: wrap }
+.lp-card {
+  background: var(--s1); border: 1px solid var(--bdr); padding: 6px 8px;
+  display: flex; align-items: center; gap: 8px; min-width: 170px; max-width: 230px;
+  transition: border-color .2s;
+}
+.lp-card.done { border-color: var(--acc) }
+.lp-img { width: 90px; height: 36px; object-fit: contain; background: #000; border: 1px solid var(--bdr2); flex-shrink: 0; display: block }
+.lp-info { flex: 1; min-width: 0 }
+.lp-cam { font-size: 9px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.lp-num { font-size: 12.5px; font-weight: 700; font-family: var(--mono); letter-spacing: .06em; color: var(--acc); white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+.lp-num.pending { color: var(--muted); font-weight: 400; font-size: 11px; display: flex; align-items: center; gap: 5px }
+.lp-spinner { display: inline-block; width: 9px; height: 9px; border: 1.5px solid var(--bdr); border-top-color: var(--acc); border-radius: 50%; animation: lp-spin .7s linear infinite; flex-shrink: 0 }
+@keyframes lp-spin { to { transform: rotate(360deg) } }
 
 /* ═══════════════════════════════════════════════
    MODAL
@@ -745,6 +816,35 @@ table.data-table .multi-cam td.cam-col { color: var(--med-t); font-weight: 600 }
 .login-divider {
   border: none; border-top: 1px solid var(--bdr); margin: 4px 0;
 }
+  #poor-perf-overlay {
+    position: fixed;
+    top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(220, 38, 38, 0.9);
+    color: white;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s;
+  }
+  #poor-perf-overlay.show {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  #poor-perf-overlay h1 {
+    font-size: 48px;
+    margin-bottom: 16px;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  #poor-perf-overlay p {
+    font-size: 20px;
+    opacity: 0.9;
+  }
 </style>
 </head>
 <body>
@@ -1050,6 +1150,13 @@ table.data-table .multi-cam td.cam-col { color: var(--med-t); font-weight: 600 }
     <div class="scroll">
       <div class="feeds-grid" id="feeds-grid">
       </div>
+      <div class="lp-strip" id="lp-strip">
+        <div class="lp-hdr">
+          <span>Live Plate Detections</span>
+          <span class="live-dot live"></span>
+        </div>
+        <div class="lp-list" id="lp-list"></div>
+      </div>
     </div>
   </div>
 
@@ -1119,6 +1226,23 @@ table.data-table .multi-cam td.cam-col { color: var(--med-t); font-weight: 600 }
           <div class="chart-title">Review Status</div>
           <div id="chart-status"></div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PLATE DETAIL MODAL (shared — opened from watchlist + plates tab) -->
+  <div class="pd-overlay" id="pd-overlay" onclick="if(event.target===this)closePlateDetail()">
+    <div class="pd-modal">
+      <div class="pd-header">
+        <span class="pd-plate-text" id="pd-plate-text"></span>
+        <div style="display:flex;flex-direction:column;gap:2px;flex:1">
+          <span id="pd-cameras" style="font-size:11px;color:var(--dim)"></span>
+        </div>
+        <button class="pd-close" onclick="closePlateDetail()">✕</button>
+      </div>
+      <div class="pd-meta" id="pd-meta"></div>
+      <div class="pd-body" id="pd-body">
+        <div style="color:var(--muted);font-size:12px;padding:20px 0;text-align:center">Loading…</div>
       </div>
     </div>
   </div>
@@ -1319,6 +1443,7 @@ function logout() {
   document.getElementById('login-overlay').style.display='flex';
   if(_ws){_ws.close();_ws=null;}
   if(_feedObserver){_feedObserver.disconnect();_feedObserver=null;}
+  try { _lpClear(); } catch(_) {}
 }
 document.getElementById('logout-btn').addEventListener('click', logout);
 
@@ -1825,11 +1950,22 @@ function initWS() {
     if((msg.type==='stampede') && document.getElementById('pane-crowd').classList.contains('active')) {
       debouncedLoadCrowd();
     }
-    if(msg.type==='plate_sighting' && document.getElementById('pane-plates').classList.contains('active')) {
-      debouncedLoadPlates();
+    if(msg.type==='plate_seen') {
+      _lpShow(msg);
+    }
+    if(msg.type==='plate_sighting') {
+      _lpUpdate(msg);
+      if(document.getElementById('pane-plates').classList.contains('active')) debouncedLoadPlates();
     }
     if(msg.type==='face_capture' && document.getElementById('pane-faces').classList.contains('active')) {
       debouncedLoadFaces();
+    }
+    if(msg.type==='poor_performance') {
+      const overlay = document.getElementById('poor-perf-overlay');
+      document.getElementById('poor-perf-msg').textContent = msg.message;
+      overlay.classList.add('show');
+      if (window._poorPerfTimeout) clearTimeout(window._poorPerfTimeout);
+      window._poorPerfTimeout = setTimeout(() => overlay.classList.remove('show'), 3000);
     }
     if(msg.type==='safety_alert' && document.getElementById('pane-crowd').classList.contains('active')) {
       debouncedLoadCrowd();
@@ -2078,13 +2214,63 @@ function renderBars(id, data, map={}) {
     </div>`).join('');
 }
 
+// ── Plate detail modal ─────────────────────────────────
+function closePlateDetail() {
+  document.getElementById('pd-overlay').classList.remove('open');
+}
+document.addEventListener('keydown', e => { if(e.key==='Escape') closePlateDetail(); });
+
+window.showPlateDetail = async function(plateText) {
+  const overlay = document.getElementById('pd-overlay');
+  document.getElementById('pd-plate-text').textContent = plateText;
+  document.getElementById('pd-cameras').textContent = '';
+  document.getElementById('pd-meta').innerHTML = '';
+  document.getElementById('pd-body').innerHTML = '<div style="color:var(--muted);font-size:12px;padding:20px 0;text-align:center">Loading…</div>';
+  overlay.classList.add('open');
+  try {
+    const r = await api('/api/plates/'+encodeURIComponent(plateText)+'/history');
+    if(!r.ok){ document.getElementById('pd-body').innerHTML='<div style="color:var(--hi-t);padding:20px">Failed to load history.</div>'; return; }
+    const d = await r.json();
+    document.getElementById('pd-cameras').textContent =
+      d.cameras_seen && d.cameras_seen.length ? 'Seen on: ' + d.cameras_seen.join(' · ') : 'No cameras recorded';
+    const fmt = iso => iso ? new Date(iso).toLocaleString('en-IN',{dateStyle:'medium',timeStyle:'medium'}) : '—';
+    const relFmt = iso => iso ? relTime(iso.replace('Z','')) : '—';
+    document.getElementById('pd-meta').innerHTML = [
+      ['Total sightings', d.total_sightings],
+      ['Cameras', (d.cameras_seen||[]).length],
+      ['First seen', fmt(d.first_seen)],
+      ['Last seen', fmt(d.last_seen)],
+    ].map(([l,v])=>`<div class="pd-meta-item"><span class="pd-meta-label">${l}</span><span class="pd-meta-val">${v}</span></div>`).join('');
+    if(!d.sightings || !d.sightings.length){
+      document.getElementById('pd-body').innerHTML='<div style="color:var(--muted);font-size:12px;padding:20px 0;text-align:center">No sightings recorded yet</div>';
+      return;
+    }
+    document.getElementById('pd-body').innerHTML = d.sightings.slice().reverse().map(s=>{
+      const cropHtml = s.plate_crop_path
+        ? `<img class="pd-sighting-crop" src="/api/evidence/${encodeURIComponent(s.plate_crop_path)}" loading="lazy" onerror="this.style.display='none'">`
+        : `<div class="pd-sighting-crop-ph"></div>`;
+      const conf = s.ocr_confidence != null ? Math.round(s.ocr_confidence*100)+'%' : '—';
+      const cross = s.is_cross_camera_match ? '<span class="pd-cross">⚠ Cross-cam</span>' : '';
+      const ts = new Date(s.timestamp).toLocaleString('en-IN',{dateStyle:'short',timeStyle:'medium'});
+      return `<div class="pd-sighting">
+        ${cropHtml}
+        <span class="pd-cam-badge">${escHtml(s.camera_id)}</span>
+        <div style="flex:1;min-width:0">
+          <div style="font-size:12px;color:var(--fg);font-family:var(--mono)">${ts}</div>
+          <div style="font-size:10.5px;color:var(--muted);margin-top:2px">OCR ${conf} ${cross}</div>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e){ document.getElementById('pd-body').innerHTML='<div style="color:var(--hi-t);padding:20px">Error: '+escHtml(String(e))+'</div>'; }
+};
+
 // ── Watchlist ──────────────────────────────────────────
 async function loadWatchlist() {
   try {
     const r = await api('/api/watchlist'); if(!r.ok) return;
     const items = await r.json();
     document.getElementById('wl-tbody').innerHTML = items.map(w=>`<tr>
-      <td class="mono">${escHtml(w.plate_pattern)}</td>
+      <td><span class="wl-plate-link" onclick="showPlateDetail(${JSON.stringify(w.plate_pattern)})">${escHtml(w.plate_pattern)}</span></td>
       <td>${escHtml(w.reason||'—')}</td>
       <td style="color:var(--muted);font-family:var(--mono)">${new Date(w.added_at+'Z').toLocaleDateString('en-IN')}</td>
       <td><button class="btn danger xs" onclick="removeWL(${w.id})">Remove</button></td>
@@ -2139,11 +2325,71 @@ async function loadSubjects() {
 
 document.getElementById('subjects-refresh-btn').addEventListener('click', loadSubjects);
 
-// ── Live Feeds (dynamic camera management) ───────────
+// ── Live Feeds (WebSocket canvas player) ─────────────
 let _samplesCache = null;
+const _feedWS = new Map();   // camera_id → WebSocket
+
+function _openFeedWS(cid) {
+  // Close any existing connection first
+  _closeFeedWS(cid);
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/ws/video/${encodeURIComponent(cid)}`);
+  ws.binaryType = 'arraybuffer';
+  _feedWS.set(cid, ws);
+
+  const canvas = document.getElementById('feed-canvas-' + cid);
+  const errEl  = document.getElementById('feed-err-' + cid);
+  const card   = document.getElementById('feed-' + cid);
+
+  ws.onopen = () => {
+    if(canvas) canvas.style.display = '';
+    if(errEl)  errEl.style.display = 'none';
+    if(card)   card.classList.remove('offline');
+  };
+
+  ws.onmessage = (e) => {
+    if(!canvas) return;
+    const blob = new Blob([e.data], { type: 'image/jpeg' });
+    createImageBitmap(blob).then(bmp => {
+      const ctx = canvas.getContext('2d');
+      // Resize canvas to match source frame dimensions (once)
+      if(canvas.width !== bmp.width || canvas.height !== bmp.height) {
+        canvas.width  = bmp.width;
+        canvas.height = bmp.height;
+      }
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close();
+    }).catch(() => {});
+  };
+
+  ws.onerror = () => {
+    if(canvas) canvas.style.display = 'none';
+    if(errEl)  errEl.style.display = 'flex';
+    if(card)   card.classList.add('offline');
+  };
+
+  ws.onclose = () => {
+    // Auto-reconnect after 3 s if the feed card still exists
+    if(!document.getElementById('feed-' + cid)) return;
+    setTimeout(() => {
+      if(document.getElementById('feed-' + cid)) _openFeedWS(cid);
+    }, 3000);
+  };
+}
+
+function _closeFeedWS(cid) {
+  const existing = _feedWS.get(cid);
+  if(existing) {
+    existing.onclose = null;  // prevent auto-reconnect
+    existing.close();
+    _feedWS.delete(cid);
+  }
+}
 
 function _disconnectFeeds() {
-  document.querySelectorAll('.feed-img[data-src]').forEach(img => { img.src = ''; });
+  _feedWS.forEach((_, cid) => _closeFeedWS(cid));
+  _lpClear();
 }
 
 async function loadFeeds() {
@@ -2153,6 +2399,8 @@ async function loadFeeds() {
     const r = await api('/api/live/cameras');
     if(r.ok){ const d = await r.json(); cams = d.cameras || []; }
   } catch(_){}
+
+  _disconnectFeeds();
 
   if(!cams.length){
     grid.innerHTML = `<div class="feeds-empty">
@@ -2178,10 +2426,7 @@ async function loadFeeds() {
         <span class="feed-live-badge">LIVE</span>
       </div>
       <button class="feed-remove-btn" data-cam="${cid}">✕ Remove</button>
-      <img class="feed-img" id="feed-img-${cid}"
-           data-src="/api/cameras/${cid}/mjpeg"
-           alt="${escHtml(cid)}"
-           style="background:#000">
+      <canvas class="feed-img" id="feed-canvas-${cid}" style="background:#000"></canvas>
       <div class="feed-offline-msg" id="feed-err-${cid}">
         <div class="off-icon">NO SIGNAL</div>
         <div class="off-txt">Pipeline not running</div>
@@ -2195,6 +2440,7 @@ async function loadFeeds() {
       const cam = btn.dataset.cam;
       if(!confirm(`Remove camera ${cam}?`)) return;
       try {
+        _closeFeedWS(cam);
         const r = await api(`/api/cameras/${cam}`, {method:'DELETE'});
         if(r.ok) { setTimeout(loadFeeds, 300); }
         else { const err = await r.json(); alert(err.detail||'Error'); }
@@ -2202,31 +2448,21 @@ async function loadFeeds() {
     });
   });
 
+  // Start a WebSocket player for each camera card
+  cams.forEach(cid => _openFeedWS(cid));
+
+  // Pause/resume streams based on viewport visibility to save bandwidth
   if(_feedObserver) _feedObserver.disconnect();
   _feedObserver = new IntersectionObserver((entries) => {
     entries.forEach(entry => {
-      const img = entry.target.querySelector('.feed-img[data-src]');
-      if(!img) return;
+      const cid = entry.target.id.replace('feed-', '');
       if(entry.isIntersecting) {
-        if(!img.hasAttribute('src') || img.src === window.location.href || img.src.endsWith('/')) {
-          img.style.display = '';
-          const errEl = document.getElementById('feed-err-'+entry.target.id.replace('feed-',''));
-          if(errEl) errEl.style.display = 'none';
-          entry.target.classList.remove('offline');
-          
-          img.src = img.dataset.src;
-          img.onerror = () => {
-            img.style.display='none';
-            if(errEl) errEl.style.display='flex';
-            entry.target.classList.add('offline');
-          };
-        }
+        if(!_feedWS.has(cid)) _openFeedWS(cid);
       } else {
-        img.removeAttribute('src');
+        _closeFeedWS(cid);
       }
     });
   }, { threshold: 0.1 });
-
   document.querySelectorAll('.feed-card').forEach(card => _feedObserver.observe(card));
 }
 
@@ -2234,6 +2470,88 @@ document.getElementById('feeds-refresh-btn').addEventListener('click', () => {
   _disconnectFeeds();
   loadFeeds();
 });
+
+// Reconnect WebSocket feeds when the browser tab regains focus
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    _feedWS.forEach((_, cid) => _closeFeedWS(cid));
+    return;
+  }
+  const feedsPane = document.getElementById('pane-feeds');
+  if (!feedsPane || !feedsPane.classList.contains('active')) return;
+  document.querySelectorAll('.feed-card').forEach(card => {
+    const cid = card.id.replace('feed-', '');
+    if(!_feedWS.has(cid)) _openFeedWS(cid);
+  });
+});
+
+// ── Live plate strip ──────────────────────────────────
+const _lpMap = new Map();   // key: `${cam}:${tid}` → card element
+const _LP_MAX = 16;
+
+function _lpKey(cam, tid) { return `${cam}:${tid}`; }
+
+function _lpShow(ev) {
+  const key = _lpKey(ev.camera_id, ev.track_id);
+  if (_lpMap.has(key)) return;
+
+  const strip = document.getElementById('lp-strip');
+  const list  = document.getElementById('lp-list');
+  if (!strip || !list) return;
+
+  const card = document.createElement('div');
+  card.className = 'lp-card';
+  card.dataset.key = key;
+
+  const img = document.createElement('img');
+  img.className = 'lp-img';
+  img.src = 'data:image/jpeg;base64,' + ev.crop_b64;
+  img.alt = '';
+
+  const info = document.createElement('div');
+  info.className = 'lp-info';
+  const fast = ev.fast_text || '';
+  info.innerHTML =
+    `<div class="lp-cam">${escHtml(ev.camera_id)}</div>` +
+    `<div class="lp-num pending"><span class="lp-spinner"></span>${fast ? escHtml(fast)+' …' : 'reading…'}</div>`;
+
+  card.appendChild(img);
+  card.appendChild(info);
+
+  // Newest first
+  list.insertBefore(card, list.firstChild);
+  _lpMap.set(key, card);
+
+  // Trim to _LP_MAX
+  while (_lpMap.size > _LP_MAX) {
+    const oldKey = _lpMap.keys().next().value;
+    const oldCard = _lpMap.get(oldKey);
+    if (oldCard && oldCard.parentNode) oldCard.parentNode.removeChild(oldCard);
+    _lpMap.delete(oldKey);
+  }
+
+  strip.style.display = '';
+}
+
+function _lpUpdate(ev) {
+  const key = _lpKey(ev.camera_id, ev.track_id);
+  const card = _lpMap.get(key);
+  if (!card) return;
+  const numEl = card.querySelector('.lp-num');
+  if (numEl) {
+    numEl.textContent = ev.plate_text || '?';
+    numEl.classList.remove('pending');
+  }
+  card.classList.add('done');
+}
+
+function _lpClear() {
+  _lpMap.clear();
+  const list = document.getElementById('lp-list');
+  if (list) list.innerHTML = '';
+  const strip = document.getElementById('lp-strip');
+  if (strip) strip.style.display = 'none';
+}
 
 // ── Add Camera Modal ──────────────────────────────────
 const addCamModal = document.getElementById('add-cam-modal');
@@ -2416,6 +2734,35 @@ document.addEventListener('keydown', e => {
     _expandedId=null;
   }
 });
+</script>
+<div id="poor-perf-overlay">
+  <h1>⚠ POOR PERFORMANCE</h1>
+  <p id="poor-perf-msg">Dropping frames due to slow processing</p>
+</div>
+
+<script>
+document.addEventListener('click', (e) => {
+  try {
+    let el = e.target;
+    let tag = el.tagName.toLowerCase();
+    let text = (el.innerText || el.textContent || '').substring(0, 50).trim();
+    let id = el.id ? `#${el.id}` : '';
+    let cls = el.className && typeof el.className === 'string' ? `.${el.className.replace(/\s+/g, '.')}` : '';
+    let elementStr = `${tag}${id}${cls}`;
+    if(elementStr.length > 100) elementStr = elementStr.substring(0, 100);
+    if(tag === 'html' || tag === 'body') return;
+    
+    fetch('/api/log_event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (window.TOKEN || '') },
+      body: JSON.stringify({
+        event: 'click',
+        element: elementStr,
+        details: text
+      })
+    }).catch(()=>{});
+  } catch(err) {}
+}, {capture: true, passive: true});
 </script>
 </body>
 </html>

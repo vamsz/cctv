@@ -60,7 +60,7 @@ triple_riding:
 violence:
   clip_confirm_threshold: 0.35
   clip_model: r3d_18
-  clip_poll_interval_frames: 120
+  clip_poll_interval_frames: 180
   clip_stale_after_frames: 180
   enabled: true
   frame_min_positive: 4

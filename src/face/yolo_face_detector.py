@@ -62,11 +62,11 @@ class YoloFaceDetector:
         device: str = "cpu",
         conf_threshold: float = 0.35,
         min_side_px: int = 24,
-        min_quality: float = 12.0,
+        min_quality: float = 10.0,
         enhance_crops: bool = True,
-        min_output_side: int = 160,
+        min_output_side: int = 112,
         context_pad: float = 0.55,
-        max_upscale: float = 3.0,
+        max_upscale: float = 2.5,
         require_inside_person: bool = True,
     ):
         self.device = device
@@ -247,7 +247,8 @@ def _enhance_face_crop(
         scale = min(max(min_output_side / h, min_output_side / w), max_upscale)
         new_w = int(w * scale)
         new_h = int(h * scale)
-        crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        interp = cv2.INTER_LANCZOS4 if scale <= 2.0 else cv2.INTER_CUBIC
+        crop = cv2.resize(crop, (new_w, new_h), interpolation=interp)
 
     # 2) CLAHE on the L channel of LAB colour space
     if crop.ndim == 3:

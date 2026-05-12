@@ -505,11 +505,23 @@ def _bulk(body: BulkReviewIn, target: ReviewStatus, actor: Optional[User] = None
 
 
 @app.get("/api/evidence/{key:path}")
-def evidence(key: str):
+async def evidence(key: str):
     store = get_object_store()
-    if not store.exists(key):
+    
+    if hasattr(store, "root"):
+        full = store._abs(key)
+        if not full.exists():
+            raise HTTPException(status_code=404, detail="not found")
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            str(full), 
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=31536000, immutable"}
+        )
+
+    if not await asyncio.to_thread(store.exists, key):
         raise HTTPException(status_code=404, detail="not found")
-    data = store.get_bytes(key)
+    data = await asyncio.to_thread(store.get_bytes, key)
     return StreamingResponse(
         io.BytesIO(data), media_type="image/jpeg",
         headers={"Cache-Control": "public, max-age=31536000, immutable"},
@@ -650,6 +662,17 @@ def reid_stats(_: User = Depends(require_role("admin", "supervisor", "reviewer",
         return {"enabled": False, "error": "pipeline not running"}
 
 
+class UIEvent(BaseModel):
+    event: str
+    element: str
+    details: str
+
+@app.post("/api/log_event", status_code=200)
+async def log_ui_event(payload: UIEvent, _: None = Depends(rate_limit)):
+    log.info("UI Click | %s | %s", payload.element, payload.details)
+    return {"status": "ok"}
+
+
 # ----------------------------------------------------------------- incidents
 
 
@@ -766,17 +789,44 @@ async def camera_mjpeg(camera_id: str):
 
     async def generate():
         boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+        last_bytes: Optional[bytes] = None
         while True:
             data = get_live_frame(camera_id)
-            if data:
+            # Only send when the frame has actually changed (avoids duplicate
+            # JPEG bytes saturating the browser's decode queue).
+            if data and data is not last_bytes:
                 yield boundary + data + b"\r\n"
-            await asyncio.sleep(0.10)   # ~10fps
+                last_bytes = data
+            await asyncio.sleep(0.033)   # ~30fps cap
 
     return StreamingResponse(
         generate(),
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={"Cache-Control": "no-cache, no-store", "Connection": "keep-alive"},
     )
+
+
+@app.websocket("/ws/video/{camera_id}")
+async def ws_video(websocket: WebSocket, camera_id: str):
+    """Binary JPEG stream for a single camera — drives the canvas live feed.
+
+    Sends raw JPEG bytes at up to 30fps. Client draws each frame onto a
+    <canvas> element. No MJPEG buffering — always shows the latest frame.
+    """
+    from src.pipeline.runner import get_live_frame
+    await websocket.accept()
+    last_bytes: Optional[bytes] = None
+    try:
+        while True:
+            data = get_live_frame(camera_id)
+            if data and data is not last_bytes:
+                await websocket.send_bytes(data)
+                last_bytes = data
+            await asyncio.sleep(0.033)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 
 @app.get("/api/live/cameras")

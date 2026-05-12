@@ -33,6 +33,7 @@ Sources:
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import dataclass
 from typing import Optional
@@ -393,6 +394,14 @@ _ENGINE_TRUST_CAP = {
 }
 
 
+_UK_FORMAT = re.compile(r"^[A-Z]{2}\d{2}[A-Z]{3}$")
+
+# Minimum confidence to accept a non-Indian plate read.
+# High threshold: in Indian traffic footage almost all plates are Indian-format.
+# Non-Indian reads at low confidence are nearly always hallucinations.
+_MIN_CONF_GENERIC = 0.80
+
+
 def _score(read: PlateRead) -> float:
     """Score a candidate read. Reads matching a known plate format
     get a big bonus; reads of suspicious length get penalised; reads
@@ -405,12 +414,15 @@ def _score(read: PlateRead) -> float:
     score = base_conf
 
     indian = normalize_indian_plate(text) is not None
+    uk = _UK_FORMAT.match(text) is not None
     generic = normalize_plate(text) is not None
     n = len(text)
     if indian:
         score += 0.40                  # strong: matches Indian format
+    elif uk:
+        score += 0.25                  # medium: matches UK AB12CDE format
     elif generic:
-        score += 0.10                  # weaker: matches generic alphanumeric
+        score += 0.05                  # weak: generic alphanumeric only
     if 6 <= n <= 11:
         score += 0.10
     elif n < 5 or n > 13:
@@ -418,6 +430,21 @@ def _score(read: PlateRead) -> float:
     if n >= 2 and text[:2].isalpha():
         score += 0.05                  # state-code-style prefix
     return score
+
+
+def _is_acceptable(read: PlateRead) -> bool:
+    """Reject reads that are very likely hallucinations.
+
+    fast-plate-ocr/fast-alpr reads plate-shaped regions even when the text
+    is road markings, dirt, or background clutter. In an Indian traffic
+    context, any read that doesn't look like an Indian plate requires very
+    high confidence — otherwise we're logging garbage.
+    """
+    if normalize_indian_plate(read.text) is not None:
+        return True
+    # Non-Indian reads (UK format, generic alphanumeric, etc.) need
+    # high confidence or they're almost certainly hallucinations.
+    return read.confidence >= _MIN_CONF_GENERIC
 
 
 # ---------------------------------------------------------------------------
@@ -536,9 +563,16 @@ class PlateOCR:
 
         if (len(candidates) == 2
             and candidates[0].text == candidates[1].text):
-            return PlateRead(
+            merged = PlateRead(
                 text=candidates[0].text,
                 confidence=min(0.99, max(c.confidence for c in candidates) + 0.05),
                 engine="consensus",
             )
-        return max(candidates, key=_score)
+            if not _is_acceptable(merged):
+                return None
+            return merged
+
+        best = max(candidates, key=_score)
+        if not _is_acceptable(best):
+            return None
+        return best

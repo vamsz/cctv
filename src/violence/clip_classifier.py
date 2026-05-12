@@ -92,6 +92,7 @@ class ViolenceClipClassifier:
 
         self._buffers: dict[str, deque] = {}
         self._buf_lock = threading.Lock()
+        self._load_lock = threading.Lock()  # prevents double-load from pre-warm + worker
 
         self._queue: queue.Queue = queue.Queue(maxsize=8)
         self._available = _VIDEOMAE_AVAILABLE or _TORCH_VIDEO_AVAILABLE
@@ -154,68 +155,72 @@ class ViolenceClipClassifier:
     def _load_model(self) -> None:
         if self._model is not None:
             return
-        import torch
-        device = torch.device(
-            self._device_str
-            if (self._device_str == "cpu" or torch.cuda.is_available())
-            else "cpu"
-        )
-        self._device = device
-
-        # Primary: VideoMAE fine-tuned on UCF-Crime CCTV dataset
-        if _VIDEOMAE_AVAILABLE:
-            try:
-                from transformers import VideoMAEForVideoClassification
-                log.info(
-                    "Loading VideoMAE UCF-Crime model from HuggingFace (%s) — "
-                    "first run downloads ~1.2 GB...", VIDEOMAE_MODEL_ID
-                )
-                model = VideoMAEForVideoClassification.from_pretrained(VIDEOMAE_MODEL_ID)
-                model = model.eval().to(device)
-                self._model = model
-                self._backend = "videomae"
-                self._id2label = {int(k): v for k, v in model.config.id2label.items()}
-                self._violence_indices = [
-                    i for i, label in self._id2label.items()
-                    if any(kw in label.lower() for kw in _UCF_VIOLENCE_KEYWORDS)
-                ]
-                self._normal_indices = [
-                    i for i, label in self._id2label.items()
-                    if any(kw in label.lower() for kw in _UCF_NORMAL_KEYWORDS)
-                ]
-                log.info(
-                    "VideoMAE UCF-Crime loaded on %s | violence: %s | normal: %s | threshold=%.2f",
-                    device,
-                    [self._id2label[i] for i in self._violence_indices],
-                    [self._id2label[i] for i in self._normal_indices],
-                    self._threshold,
-                )
+        with self._load_lock:
+            # Double-check: another thread may have loaded while we waited
+            if self._model is not None:
                 return
-            except Exception:
-                log.exception("VideoMAE load failed — falling back to R3D-18 Kinetics-400")
+            import torch
+            device = torch.device(
+                self._device_str
+                if (self._device_str == "cpu" or torch.cuda.is_available())
+                else "cpu"
+            )
+            self._device = device
 
-        # Fallback: R3D-18 Kinetics-400
-        if _TORCH_VIDEO_AVAILABLE:
-            try:
-                weights = _tv_video.R3D_18_Weights.KINETICS400_V1
-                model = _tv_video.r3d_18(weights=weights).eval().to(device)
-                self._model = model
-                self._backend = "r3d18"
-                self._weights = weights
-                cats = weights.meta.get("categories", [])
-                self._id2label = {i: cats[i] for i in range(len(cats))}
-                self._violence_indices = [
-                    i for i, name in enumerate(cats)
-                    if any(kw in name.lower() for kw in _K400_VIOLENCE_KEYWORDS)
-                ] or list(range(10))
-                self._normal_indices = []   # K400 has no explicit "normal" sentinel
-                log.info(
-                    "R3D-18 Kinetics-400 loaded on %s (fallback) | violence classes: %d",
-                    device, len(self._violence_indices),
-                )
-            except Exception:
-                log.exception("R3D-18 load failed — classifier disabled")
-                self._available = False
+            # Primary: VideoMAE fine-tuned on UCF-Crime CCTV dataset
+            if _VIDEOMAE_AVAILABLE:
+                try:
+                    from transformers import VideoMAEForVideoClassification
+                    log.info(
+                        "Loading VideoMAE UCF-Crime model from HuggingFace (%s) — "
+                        "first run downloads ~1.2 GB...", VIDEOMAE_MODEL_ID
+                    )
+                    model = VideoMAEForVideoClassification.from_pretrained(VIDEOMAE_MODEL_ID)
+                    model = model.eval().to(device)
+                    self._model = model
+                    self._backend = "videomae"
+                    self._id2label = {int(k): v for k, v in model.config.id2label.items()}
+                    self._violence_indices = [
+                        i for i, label in self._id2label.items()
+                        if any(kw in label.lower() for kw in _UCF_VIOLENCE_KEYWORDS)
+                    ]
+                    self._normal_indices = [
+                        i for i, label in self._id2label.items()
+                        if any(kw in label.lower() for kw in _UCF_NORMAL_KEYWORDS)
+                    ]
+                    log.info(
+                        "VideoMAE UCF-Crime loaded on %s | violence: %s | normal: %s | threshold=%.2f",
+                        device,
+                        [self._id2label[i] for i in self._violence_indices],
+                        [self._id2label[i] for i in self._normal_indices],
+                        self._threshold,
+                    )
+                    return
+                except Exception:
+                    log.exception("VideoMAE load failed — falling back to R3D-18 Kinetics-400")
+
+            # Fallback: R3D-18 Kinetics-400
+            if _TORCH_VIDEO_AVAILABLE:
+                try:
+                    weights = _tv_video.R3D_18_Weights.KINETICS400_V1
+                    model = _tv_video.r3d_18(weights=weights).eval().to(device)
+                    self._model = model
+                    self._backend = "r3d18"
+                    self._weights = weights
+                    cats = weights.meta.get("categories", [])
+                    self._id2label = {i: cats[i] for i in range(len(cats))}
+                    self._violence_indices = [
+                        i for i, name in enumerate(cats)
+                        if any(kw in name.lower() for kw in _K400_VIOLENCE_KEYWORDS)
+                    ] or list(range(10))
+                    self._normal_indices = []   # K400 has no explicit "normal" sentinel
+                    log.info(
+                        "R3D-18 Kinetics-400 loaded on %s (fallback) | violence classes: %d",
+                        device, len(self._violence_indices),
+                    )
+                except Exception:
+                    log.exception("R3D-18 load failed — classifier disabled")
+                    self._available = False
 
     def _sample_clip(self, frames: list[np.ndarray]) -> "torch.Tensor":
         """Sample CLIP_LEN evenly-spaced frames, resize, normalise, return tensor."""

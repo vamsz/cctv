@@ -64,7 +64,10 @@
       "Bash(Remove-Item \"C:\\\\Users\\\\raghu\\\\Downloads\\\\cctv_pieds\\\\cctv\\\\models\\\\violence_r3d18_ft.pt\" -Force)",
       "Bash(ffprobe -v error -select_streams v:0 -show_entries stream=duration,width,height,r_frame_rate,nb_frames -of default=noprint_wrappers=1 data/samples/test_fight.mp4)",
       "Bash(cat C:\\\\\\\\Users\\\\\\\\raghu\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\\\\\\\\C--Users-raghu-Downloads-cctv-pieds-cctv\\\\\\\\09fd5a19-4456-4226-8825-44e2dc012bf1\\\\\\\\tasks\\\\\\\\bodphz5jy.output)",
-      "Bash(pip uninstall *)"
+      "Bash(pip uninstall *)",
+      "Bash(Get-ChildItem -Recurse)",
+      "Bash(Select-Object FullName)",
+      "Bash(Sort-Object FullName)"
     ]
   }
 }

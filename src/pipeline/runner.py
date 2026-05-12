@@ -16,10 +16,13 @@ and state are per-pipeline.
 """
 from __future__ import annotations
 
+import base64
 import logging
+import os
+import sys
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -107,6 +110,25 @@ def get_all_live_cameras() -> list[str]:
 def get_shared_rule_params() -> Optional[dict]:
     with _rule_params_lock:
         return _shared_rule_params
+
+
+def _set_thread_priority(above_normal: bool) -> None:
+    """Best-effort OS thread priority adjustment."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            level = 1 if above_normal else -1  # ABOVE_NORMAL / BELOW_NORMAL
+            ctypes.windll.kernel32.SetThreadPriority(
+                ctypes.windll.kernel32.GetCurrentThread(), level)
+        else:
+            # POSIX: nice value (requires CAP_SYS_NICE for negative nice)
+            inc = -5 if above_normal else 5
+            try:
+                os.nice(inc)
+            except PermissionError:
+                pass
+    except Exception:
+        pass
 
 
 @dataclass
@@ -198,7 +220,9 @@ class CameraPipeline:
         # person comes in, instead of INSERTing endlessly.
         self._face_track_db_ids: dict[tuple, list[int]] = {}
 
-        self.reader = StreamReader(StreamConfig(camera_id=spec.id, source=spec.source, fps_cap=spec.fps_cap))
+        import queue
+        self._inference_queue = queue.Queue(maxsize=100)
+        self._reader_thread: Optional[threading.Thread] = None
         self.tracker = Tracker(frame_rate=spec.fps_cap)
         self.signal_clf = SignalClassifier(spec.signal_roi)
         self.rules = RulesEngine(
@@ -347,23 +371,25 @@ class CameraPipeline:
         # ("XA02NH7256, KA02NH7256, KA02NH7Z56, ...") into one row per
         # car that refines as more frames arrive.
         self._track_sighting_db_id: dict[int, int] = {}
-        # Cache of the most recent annotated frame from inference. The stream
-        # loop pushes this so detection boxes + plate text stay visible at
-        # full MJPEG framerate even though inference runs slower.
-        self._latest_annotated: Optional[np.ndarray] = None
-        self._latest_annotated_lock = threading.Lock()
-
         # Slow refinement workers. The inference thread must stay free to
         # consume the newest frame; CPU PaddleOCR, face embedding and DB work
         # run here and are drained opportunistically by the next frame.
         self._ocr_executor = ThreadPoolExecutor(
-            max_workers=max(1, int(settings.ocr_async_workers)),
+            max_workers=1,
             thread_name_prefix=f"ocr-{self.spec.id}",
         )
         self._ocr_pending: dict[int, Future] = {}
         self._ocr_pending_meta: dict[int, tuple[int, tuple[float, float, float, float]]] = {}
         self._ocr_ready: dict[int, list[tuple[PlateRead, int]]] = defaultdict(list)
         self._ocr_lock = threading.Lock()
+        # Tracks that have already had a plate_seen WS event fired (once per track).
+        self._plate_first_seen: set[int] = set()
+        # Wallclock time when each OCR job was submitted — used to measure OCR latency.
+        self._ocr_submit_time: dict[int, float] = {}
+        # Perf counters for periodic summary log.
+        self._perf_frames: int = 0
+        self._perf_ms_sum: float = 0.0
+        self._perf_t0: float = time.monotonic()
 
         self._face_executor = ThreadPoolExecutor(
             max_workers=max(1, int(settings.face_async_workers)),
@@ -371,15 +397,63 @@ class CameraPipeline:
         )
         self._face_pending: set[Future] = set()
 
+        # Crowd DB writes are ~100-300 ms (SQLite). Run them off the
+        # inference thread so they don't add to the frame latency budget.
+        self._crowd_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"crowd-{self.spec.id}",
+        )
+        # Optical-flow throttle: run Farneback every N+1 frames; reuse
+        # smoothed history on skipped frames. Prevents 300+ ms budget
+        # spikes when the crowd snapshot also writes to SQLite.
+        self._flow_skip: int = 4   # compute flow every 5th frame
+        self._flow_ticker: int = 0
+
+        # Plate sighting DB writes (SQLite SELECT + INSERT/UPDATE + JPEG save)
+        # block the inference thread for 8-11 s. Run them on a dedicated
+        # background thread and drain results back into inference-thread state
+        # at the start of each frame (same pattern as async OCR).
+        self._db_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"db-{self.spec.id}",
+        )
+        self._plate_db_lock = threading.Lock()
+        # Track IDs whose INSERT is currently in flight — prevents a second
+        # INSERT before the first one's row_id has been drained back.
+        self._plate_insert_pending: set[int] = set()
+        # Completed INSERT results waiting to be drained into _track_sighting_db_id.
+        self._plate_db_results: dict[int, int] = {}
+
+        # ReID background executor — DINOv2 GPU inference runs here so it
+        # never blocks the inference thread. max_workers=2 so two vehicles
+        # can embed in parallel while CUDA serialises the actual kernels.
+        self._reid_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix=f"reid-{self.spec.id}",
+        )
+        self._reid_lock = threading.Lock()
+        # track_id → in-flight Future (prevents queuing multiple jobs per track)
+        self._reid_pending: dict[int, Future] = {}
+        # Completed results waiting to be applied in the next frame loop
+        self._reid_ready: dict[int, tuple] = {}  # track_id → (global_id, sim, propagated_plate)
+
     def start(self) -> None:
         self.reader.start()
-        # Stream thread: pushes every frame to MJPEG buffer at full speed
+        # Buffer filler: reads camera at fps_cap, fills FrameBuffer.
+        # High OS priority so it never gets preempted by inference threads.
+        self._reader_thread = threading.Thread(
+            target=self._buffer_fill_loop, daemon=True,
+            name=f"buf-{self.spec.id}",
+        )
+        self._reader_thread.start()
+        # Stream thread: encodes MJPEG live feed at 30fps.
         self._stream_thread = threading.Thread(
             target=self._stream_loop, daemon=True,
             name=f"stream-{self.spec.id}",
         )
         self._stream_thread.start()
-        # Inference thread: processes frames at whatever speed GPU allows
+        # Inference thread: reads from queue at capped fps, runs models.
+        # Low OS priority — all other threads take precedence.
         self._thread = threading.Thread(
             target=self._inference_loop, daemon=True,
             name=f"inference-{self.spec.id}",
@@ -390,72 +464,83 @@ class CameraPipeline:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=4.0)
-        if self._stream_thread:
+        if hasattr(self, "_stream_thread") and self._stream_thread:
             self._stream_thread.join(timeout=2.0)
+        if self._reader_thread:
+            self._reader_thread.join(timeout=2.0)
         self._ocr_executor.shutdown(wait=False, cancel_futures=True)
         self._face_executor.shutdown(wait=False, cancel_futures=True)
+        self._crowd_executor.shutdown(wait=False, cancel_futures=True)
+        self._db_executor.shutdown(wait=False, cancel_futures=True)
+        self._reid_executor.shutdown(wait=False, cancel_futures=True)
         self.reader.stop()
         # Clean up live frame buffer
         with _live_frame_lock:
             _live_frames.pop(self.spec.id, None)
 
-    # ------------------------------------------- stream loop (smooth MJPEG)
+    # --------------------------------------- buffer filler + stream loop
+
+    def _buffer_fill_loop(self) -> None:
+        """Read raw frames from camera and push to inference queue at 6 FPS.
+
+        Runs at ABOVE_NORMAL OS priority.
+        """
+        import queue
+        _set_thread_priority(above_normal=True)
+        _last_enqueue = 0.0
+        last_idx = -1
+        while not self._stop.is_set():
+            packet = self.reader.read()
+            if packet is not None:
+                idx, ts, frame = packet
+                if idx != last_idx:
+                    now = time.monotonic()
+                    if now - _last_enqueue >= 1.0 / 6.0:
+                        _last_enqueue = now
+                        last_idx = idx
+                        try:
+                            self._inference_queue.put_nowait((idx, ts, frame))
+                        except queue.Full:
+                            self._trigger_poor_performance()
+
+            time.sleep(0.005)  # yield, ~200fps max read rate
 
     def _stream_loop(self) -> None:
-        """Push the most recently annotated frame at MJPEG rate.
-
-        PERF: only re-encodes when the cached annotation has changed. The
-        update_live_frame call does cv2.imencode which costs ~5-10 ms per
-        push — at 25 Hz that's 250 ms/sec/camera. Skipping unchanged
-        frames reclaims most of that for inference.
-        """
-        last_annotated_id = -1
-        last_push = 0.0
+        """Encode MJPEG live stream at 30 FPS ceiling to decouple from inference."""
+        _set_thread_priority(above_normal=True)
+        last_idx = -1
         while not self._stop.is_set():
-            now = time.monotonic()
-            with self._latest_annotated_lock:
-                cached = self._latest_annotated
-                cached_id = id(cached) if cached is not None else -1
+            packet = self.reader.read()
+            if packet is not None:
+                idx, ts, frame = packet
+                if idx != last_idx:
+                    update_live_frame(self.spec.id, frame, quality=60)
+                    last_idx = idx
+            time.sleep(0.033)  # 30fps ceiling
 
-            if cached is not None:
-                # Only re-encode when the underlying frame object changed.
-                if cached_id != last_annotated_id:
-                    update_live_frame(self.spec.id, cached, quality=60)
-                    last_annotated_id = cached_id
-                    last_push = now
-                elif now - last_push >= 0.12:
-                    # Inference can be slower than the camera. Push a raw
-                    # fresh frame between annotated frames so the MJPEG view
-                    # keeps moving instead of looking frozen.
-                    packet = self.reader.read()
-                    if packet is not None:
-                        _, _, frame = packet
-                        update_live_frame(self.spec.id, frame, quality=50)
-                        last_push = now
-            else:
-                # Cold-start fallback so the feed isn't black before first inference
-                packet = self.reader.read()
-                if packet is not None:
-                    _, _, frame = packet
-                    update_live_frame(self.spec.id, frame, quality=55)
-                    last_push = now
-            # 40 ms = 25 fps MJPEG ceiling. With unchanged-frame skip this
-            # is the *upper* bound on encoding work, not a steady rate.
-            time.sleep(0.04)
+    def _trigger_poor_performance(self) -> None:
+        from src.api.server import push_violation_event
+        now = time.monotonic()
+        if not hasattr(self, "_last_poor_perf") or now - self._last_poor_perf > 2.0:
+            self._last_poor_perf = now
+            push_violation_event({
+                "type": "poor_performance",
+                "camera_id": self.spec.id,
+                "message": "Poor Performance: Dropping frames (buffer full)"
+            })
+            log.warning("[%s] POOR PERFORMANCE: Inference buffer full, dropping new frame", self.spec.id)
 
     # ------------------------------------------- inference loop (GPU work)
 
     def _inference_loop(self) -> None:
-        """Grab the latest unprocessed frame and run full detection pipeline.
-        
-        Naturally skips frames it can't keep up with — no warnings, no
-        backlog. The stream itself stays smooth via _stream_loop.
+        """Pull frames from inference queue and run the full pipeline.
         """
+        import queue
         from src.common.metrics import frames_total
         while not self._stop.is_set():
-            packet = self.reader.read_for_inference()
-            if packet is None:
-                time.sleep(0.005)
+            try:
+                packet = self._inference_queue.get(timeout=0.1)
+            except queue.Empty:
                 continue
             frame_idx, ts, frame = packet
             frames_total.labels(camera_id=self.spec.id).inc()
@@ -486,6 +571,9 @@ class CameraPipeline:
             if read is None:
                 continue
             frame_idx = meta[0] if meta else self._latest_inference_frame_idx
+            _ocr_ms = (time.monotonic() - self._ocr_submit_time.pop(tid, time.monotonic())) * 1000
+            log.debug("[%s] ocr-done   track=%d text=%-12s conf=%.2f latency=%.0fms",
+                      self.spec.id, tid, read.text or "(none)", read.confidence, _ocr_ms)
             with self._ocr_lock:
                 reads = self._ocr_ready[tid]
                 reads.append((read, frame_idx))
@@ -496,6 +584,106 @@ class CameraPipeline:
         with self._ocr_lock:
             reads = self._ocr_ready.pop(track_id, [])
         return reads
+
+    def _drain_plate_db_results(self) -> None:
+        """Drain completed plate-sighting INSERTs back into inference-thread state.
+
+        Background thread writes to _plate_db_results under _plate_db_lock.
+        Inference thread calls this at the start of every frame to pick up new
+        row IDs — so subsequent calls for the same track do UPDATEs, not INSERTs.
+        """
+        with self._plate_db_lock:
+            if not self._plate_db_results:
+                return
+            results = dict(self._plate_db_results)
+            self._plate_db_results.clear()
+            self._plate_insert_pending -= set(results.keys())
+        for tid, rid in results.items():
+            self._track_sighting_db_id[tid] = rid
+
+    def _drain_reid_results(self) -> None:
+        """Apply any orphaned ReID results (tracks no longer in the for loop)."""
+        with self._reid_lock:
+            if not self._reid_ready:
+                return
+            ready = dict(self._reid_ready)
+        for tid, (global_id, match_sim, propagated_plate) in ready.items():
+            existing = self._track_attrs.get(tid)
+            color = existing[1] if existing else None
+            vtype = existing[2] if existing else None
+            self._track_attrs[tid] = (global_id, color, vtype)
+            if propagated_plate:
+                existing_plate, _ = self.rules.best_plate(tid)
+                if not existing_plate:
+                    self.rules.attach_plate_read(tid, propagated_plate, 0.60)
+            if match_sim > 0 and global_id:
+                self._db_executor.submit(
+                    self._persist_reid_subject_bg, global_id, match_sim, tid, color, vtype)
+        with self._reid_lock:
+            for tid in ready:
+                self._reid_ready.pop(tid, None)
+                self._reid_pending.pop(tid, None)
+
+    def _reid_bg(
+        self,
+        track_id: int,
+        crop: np.ndarray,
+        plate_text: Optional[str],
+        color: Optional[str],
+        vtype: Optional[str],
+    ) -> None:
+        """Background: extract DINOv2 embedding and update ReID store."""
+        global_id, match_sim, propagated_plate = None, 0.0, None
+        try:
+            emb = self.reid.embedder.extract_crop(crop)
+            if emb is not None:
+                global_id, match_sim, propagated_plate = self.reid.process_embedding(
+                    emb, self.spec.id, track_id, plate_text, color, vtype)
+        except Exception:
+            log.debug("[%s] reid bg track=%d failed", self.spec.id, track_id, exc_info=True)
+        with self._reid_lock:
+            self._reid_pending.pop(track_id, None)
+            if global_id:
+                self._reid_ready[track_id] = (global_id, match_sim, propagated_plate)
+
+    def _persist_reid_subject_bg(
+        self,
+        global_id: str,
+        match_sim: float,
+        track_id: int,
+        color: Optional[str],
+        vtype: Optional[str],
+    ) -> None:
+        """Background: persist a cross-camera ReID match row."""
+        try:
+            from src.common.db import session_scope
+            from src.evidence.models import ReidSubject
+            plate_text, _ = self.rules.best_plate(track_id)
+            now = datetime.utcnow()
+            with session_scope() as s:
+                row = s.get(ReidSubject, global_id)
+                if row is None:
+                    row = ReidSubject(
+                        global_id=global_id,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        camera_ids=[self.spec.id],
+                        plate_text=plate_text,
+                        vehicle_color=color,
+                        vehicle_type=vtype,
+                        match_count=1,
+                    )
+                    s.add(row)
+                else:
+                    row.last_seen_at = now
+                    row.match_count = (row.match_count or 0) + 1
+                    if plate_text and not row.plate_text:
+                        row.plate_text = plate_text
+                    cameras = row.camera_ids or []
+                    if self.spec.id not in cameras:
+                        row.camera_ids = cameras + [self.spec.id]
+        except Exception:
+            pass
 
     def _schedule_plate_ocr(
         self,
@@ -518,11 +706,16 @@ class CameraPipeline:
         crop = _crop_padded(frame, plate.xyxy, pad=0.25)
         if crop is None or crop.size == 0:
             return
+        _gap = frame_idx - last
         self._track_last_ocr_frame[track_id] = frame_idx
+        self._ocr_submit_time[track_id] = time.monotonic()
         fut = self._ocr_executor.submit(self.ocr.read, crop)
         with self._ocr_lock:
             self._ocr_pending[track_id] = fut
             self._ocr_pending_meta[track_id] = (frame_idx, plate.xyxy)
+        log.debug("[%s] ocr-schedule track=%d frame=%d gap=%d consensus=%s",
+                  self.spec.id, track_id, frame_idx, _gap,
+                  self._track_consensus_plate.get(track_id, "(none)"))
 
     def _apply_plate_candidates(
         self,
@@ -568,13 +761,20 @@ class CameraPipeline:
             final_text, final_conf = stored, float(best.confidence)
 
         self.rules.attach_plate_read(td.track_id, final_text, final_conf)
+        log.info("[%s] plate read  track=%d text=%-12s conf=%.2f engine=%s cands=%d",
+                 self.spec.id, td.track_id, final_text, final_conf, best.engine, len(candidates))
         self._log_plate_sighting(td, plate, final_text, float(final_conf), frame)
 
     def _process_frame(self, frame_idx: int, ts: float, frame: np.ndarray) -> None:
+        _t_frame_start = time.monotonic()
         self._latest_inference_frame_idx = frame_idx
         self._drain_async_ocr()
+        self._drain_plate_db_results()
+        self._drain_reid_results()
+        _t0 = time.monotonic()
         bundle = self.detector(frame, frame_idx, ts)
         tracked = self.tracker.update(bundle)
+        _dt_detect = (time.monotonic() - _t0) * 1000
 
         # Attach plates → tracks by IoU, run OCR, propagate to rules engine.
         plate_dets = bundle.of(ObjectClass.LICENSE_PLATE)
@@ -590,6 +790,10 @@ class CameraPipeline:
         if self._violence_enabled and self._clip_clf.available:
             self._clip_clf.submit_frame(self.spec.id, frame)
 
+        _dt_reid_total = 0.0
+        _dt_attr_total = 0.0
+        _dt_plate_total = 0.0
+
         for td in tracked:
             cls = td.detection.cls
             if cls == ObjectClass.PERSON:
@@ -602,42 +806,89 @@ class CameraPipeline:
             self._track_first_seen_frame.setdefault(td.track_id, frame_idx)
             self._track_last_seen_frame[td.track_id] = frame_idx
 
-            # --- ReID + attributes ---
+            # --- Attributes (cached after first run) ---
+            _ta0 = time.monotonic()
+            attrs = self._track_attrs.get(td.track_id)
+            color = attrs[1] if attrs else None
+            vtype = attrs[2] if attrs else None
+            if not color and self.attr_clf:
+                crop_a = _crop(frame, td.detection.xyxy)
+                result = self.attr_clf.classify(crop_a, td.detection.cls)
+                color = result["color"]
+                vtype = result["type"]
+            _dt_attr_total += (time.monotonic() - _ta0) * 1000
+
+            # --- ReID (async: DINOv2 runs in _reid_executor) ---
+            _tr0 = time.monotonic()
             if self.reid is not None:
                 plate_text_for_reid, _ = self.rules.best_plate(td.track_id)
-                attrs = self._track_attrs.get(td.track_id)
-                color = attrs[1] if attrs else None
-                vtype = attrs[2] if attrs else None
+                global_id = attrs[0] if attrs else None
 
-                if not color and self.attr_clf:
-                    crop = _crop(frame, td.detection.xyxy)
-                    result = self.attr_clf.classify(crop, td.detection.cls)
-                    color = result["color"]
-                    vtype = result["type"]
+                # Pick up any just-finished embedding for this track
+                with self._reid_lock:
+                    reid_result = self._reid_ready.pop(td.track_id, None)
+                    already_pending = td.track_id in self._reid_pending
 
-                global_id, match_sim, propagated_plate = self.reid.process(
-                    frame=frame,
-                    xyxy=td.detection.xyxy,
-                    camera_id=self.spec.id,
-                    track_id=td.track_id,
-                    frame_idx=frame_idx,
-                    plate_text=plate_text_for_reid,
-                    vehicle_color=color,
-                    vehicle_type=vtype,
-                )
+                if reid_result is not None:
+                    global_id, match_sim, propagated_plate = reid_result
+                    self._track_attrs[td.track_id] = (global_id, color, vtype)
+                    if propagated_plate and not plate_text_for_reid:
+                        self.rules.attach_plate_read(td.track_id, propagated_plate, 0.60)
+                    if match_sim > 0 and global_id:
+                        self._db_executor.submit(
+                            self._persist_reid_subject_bg,
+                            global_id, match_sim, td.track_id, color, vtype)
+                else:
+                    self._track_attrs[td.track_id] = (global_id, color, vtype)
 
-                if propagated_plate and not plate_text_for_reid:
-                    self.rules.attach_plate_read(td.track_id, propagated_plate, 0.60)
-
-                self._track_attrs[td.track_id] = (global_id, color, vtype)
-
-                if match_sim > 0:
-                    self._persist_reid_subject(global_id, match_sim, td, color, vtype)
+                if not already_pending:
+                    if self.reid.is_due(self.spec.id, td.track_id, frame_idx):
+                        # Reserve the slot before handing off to background
+                        self.reid.mark_extracting(self.spec.id, td.track_id, frame_idx)
+                        vehicle_crop = _crop(frame, td.detection.xyxy).copy()
+                        fut = self._reid_executor.submit(
+                            self._reid_bg, td.track_id, vehicle_crop,
+                            plate_text_for_reid, color, vtype)
+                        with self._reid_lock:
+                            self._reid_pending[td.track_id] = fut
+                    else:
+                        # Fast path: just look up the cached store entry
+                        existing = self.reid.store.get_by_camera_track(self.spec.id, td.track_id)
+                        if existing and not global_id:
+                            self._track_attrs[td.track_id] = (existing.global_id, color, vtype)
+            _dt_reid_total += (time.monotonic() - _tr0) * 1000
 
             # --- plate OCR ---
             plate = self._best_plate_for_vehicle(td.detection, plate_dets)
             if plate is None:
                 continue
+
+            # First-seen: push plate crop + fast-alpr text immediately so the
+            # UI can show the image right away with an "OCR pending" state.
+            if td.track_id not in self._plate_first_seen:
+                log.info("[%s] plate bbox  track=%d frame=%d fast_alpr=%-12s conf=%.2f",
+                         self.spec.id, td.track_id, frame_idx,
+                         (plate.text or "").upper(), plate.text_conf or 0.0)
+                self._plate_first_seen.add(td.track_id)
+                if len(self._plate_first_seen) > 2000:
+                    self._plate_first_seen.clear()
+                try:
+                    _pcrop = _crop_padded(frame, plate.xyxy, pad=0.15)
+                    if _pcrop is not None and _pcrop.size > 0:
+                        _ph, _pw = _pcrop.shape[:2]
+                        if _pw > 200:
+                            _pcrop = cv2.resize(_pcrop, (200, int(_ph * 200 / _pw)), interpolation=cv2.INTER_AREA)
+                        _, _pbuf = cv2.imencode(".jpg", _pcrop, [cv2.IMWRITE_JPEG_QUALITY, 55])
+                        from src.api.server import push_violation_event as _push
+                        _push({
+                            "type": "plate_seen",
+                            "camera_id": self.spec.id,
+                            "track_id": td.track_id,
+                            "crop_b64": base64.b64encode(bytes(_pbuf)).decode(),
+                            "fast_text": "".join(c for c in (plate.text or "").upper() if c.isalnum()),
+                        })
+                except Exception:
+                    pass
 
             # Multi-engine consensus pipeline:
             #   1. Take fast-alpr's text as ONE candidate (free — it was
@@ -652,8 +903,10 @@ class CameraPipeline:
             # Indian fonts.
             candidates: list[PlateRead] = []
 
-            # Candidate 1 — fast-alpr's pre-read (only if non-trivial text)
-            if plate.text and plate.text_conf is not None and plate.text_conf >= 0.30:
+            # Candidate 1 — fast-alpr's pre-read (only if non-trivial text).
+            # Threshold 0.50: fast-alpr hallucinates at low confidence —
+            # the global model misreads road markings / background as plates.
+            if plate.text and plate.text_conf is not None and plate.text_conf >= 0.50:
                 clean = "".join(c for c in plate.text.upper() if c.isalnum())
                 if len(clean) >= 3:
                     candidates.append(PlateRead(
@@ -672,8 +925,10 @@ class CameraPipeline:
             # not a reliable trust signal. Re-run every 60 frames as a
             # sanity check in case the angle improved.
             had_consensus = self._track_consensus_plate.get(td.track_id) is not None
+            _tp0 = time.monotonic()
             self._schedule_plate_ocr(td.track_id, frame_idx, frame, plate, had_consensus)
             self._apply_plate_candidates(td, plate, candidates, frame_idx, frame)
+            _dt_plate_total += (time.monotonic() - _tp0) * 1000
             continue
             if False:
                 # ONE Paddle call per frame at the 25%-padded crop.
@@ -730,9 +985,11 @@ class CameraPipeline:
                 self.rules.attach_plate_read(td.track_id, final_text, final_conf)
                 self._log_plate_sighting(td, plate, final_text, float(final_conf), frame)
 
+        _t_rules = time.monotonic()
         signal_state = self.signal_clf.classify(frame)
         raw_events = self.rules.step(tracked, bundle, signal_state)
         raw_events += self._check_plate_unreadable(tracked, bundle, frame_idx, ts)
+        _dt_rules = (time.monotonic() - _t_rules) * 1000
 
         for ev in raw_events:
             attrs = self._track_attrs.get(ev.track_id)
@@ -747,50 +1004,78 @@ class CameraPipeline:
 
         events = self.alert_engine.filter(raw_events)
 
-        # Annotate EVERY frame so the live feed shows what's being detected,
-        # not just frames where a violation fired. We skip the placeholder
-        # stop_line — those values are not calibrated for the test footage.
-        annotated = annotate(
-            frame, bundle, tracked,
-            stop_line=None,
-            signal_state=signal_state.value if signal_state else None,
-            violations=events if events else None,
-        )
-
+        # Annotate ONLY when a violation fired (for evidence JPEG).
+        # Every-frame annotation was taking 7-9 s due to OS thread
+        # suspension, and the live feed no longer needs it.
+        _t_ann = time.monotonic()
         if events:
+            annotated = annotate(
+                frame, bundle, tracked,
+                stop_line=None,
+                signal_state=signal_state.value if signal_state else None,
+                violations=events,
+            )
             for ev in events:
                 plate_crop_img = self._plate_crop_for_event(ev, bundle, frame)
-                row_id = self.store.save(ev, frame=frame, annotated=annotated, plate_crop=plate_crop_img)
-                try:
-                    from src.api.server import push_violation_event
-                    push_violation_event({
-                        "type": "violation",
-                        "id": row_id,
-                        "code": ev.code.value,
-                        "camera_id": ev.camera_id,
-                        "track_id": ev.track_id,
-                        "plate_text": ev.plate_text,
-                        "confidence": round(ev.confidence, 3),
-                        "extras": ev.extras,
-                    })
-                except Exception:
-                    pass
+                _ev_frame = frame.copy()
+                _ev_ann = annotated.copy()
+                _ev_plate = plate_crop_img.copy() if plate_crop_img is not None and plate_crop_img.size > 0 else None
+                self._db_executor.submit(
+                    self._save_violation_bg, ev, _ev_frame, _ev_ann, _ev_plate,
+                )
+        _dt_ann = (time.monotonic() - _t_ann) * 1000
 
         # ── Step 3: Crowd analytics (uses raw frame for optical flow) ────
-        # Crowd overlay is added on top of `annotated` inside this call.
-        self._run_crowd_analytics(frame, frame_idx, person_bboxes, live_canvas=annotated)
+        _t_crowd = time.monotonic()
+        self._run_crowd_analytics(frame, frame_idx, person_bboxes, live_canvas=None)
+        _dt_crowd = (time.monotonic() - _t_crowd) * 1000
 
         # ── Step 3: Violence detection ───────────────────────────────────
+        _t_viol = time.monotonic()
         if self._violence_enabled:
             self._run_violence_detection(frame, frame_idx, person_bboxes, person_track_ids)
+        _dt_viol = (time.monotonic() - _t_viol) * 1000
 
         # ── Step 3: Loitering detection ──────────────────────────────────
+        _t_loitering = time.monotonic()
         if self._loitering_enabled and person_bboxes:
             self._run_loitering(tracked, frame_idx)
+        _dt_loiter = (time.monotonic() - _t_loitering) * 1000
 
         # ── Step 3: Abandoned object detection ───────────────────────────
+        _t_abandoned = time.monotonic()
         if self._abandoned_enabled:
             self._run_abandoned(frame, frame_idx, person_bboxes, luggage_dets)
+        _dt_abandon = (time.monotonic() - _t_abandoned) * 1000
+
+        # ── Perf accounting ──────────────────────────────────────────────
+        _dt_total = (time.monotonic() - _t_frame_start) * 1000
+        self._perf_frames += 1
+        self._perf_ms_sum += _dt_total
+        if _dt_total > 100:
+            _ocr_q = sum(1 for f in self._ocr_pending.values() if not f.done())
+            _reid_q = sum(1 for f in self._reid_pending.values() if not f.done())
+            _dt_pre = (_t0 - _t_frame_start) * 1000
+            _dt_mid = (_t_crowd - _t0) * 1000 - _dt_detect
+            log.info(
+                "[%s] SLOW frame %d  total=%.0fms  pre=%.0fms  detect=%.0fms  "
+                "mid=%.0fms (attr=%.0f reid_check=%.0f plate=%.0f rules=%.0f ann=%.0f)  "
+                "crowd=%.0fms  violence=%.0fms  loiter=%.0fms  abandon=%.0fms  ocr_q=%d  reid_q=%d",
+                self.spec.id, frame_idx, _dt_total, _dt_pre, _dt_detect,
+                _dt_mid, _dt_attr_total, _dt_reid_total, _dt_plate_total,
+                _dt_rules, _dt_ann, _dt_crowd, _dt_viol, _dt_loiter, _dt_abandon, _ocr_q, _reid_q,
+            )
+        # Periodic perf summary every 300 frames
+        if self._perf_frames >= 300:
+            elapsed = time.monotonic() - self._perf_t0
+            fps = self._perf_frames / max(elapsed, 0.001)
+            avg_ms = self._perf_ms_sum / self._perf_frames
+            _ocr_q = sum(1 for f in self._ocr_pending.values() if not f.done())
+            log.info("[%s] PERF 300-frame summary: fps=%.1f  avg_frame=%.0fms  ocr_pending=%d",
+                     self.spec.id, fps, avg_ms, _ocr_q)
+            self._perf_frames = 0
+            self._perf_ms_sum = 0.0
+            self._perf_t0 = time.monotonic()
 
     # ----------------------------------------------------- Step 3 helpers
 
@@ -802,8 +1087,14 @@ class CameraPipeline:
         live_canvas: Optional[np.ndarray] = None,
     ) -> None:
         crowd = self.density_est.update(person_bboxes)
-        flow = self.flow_analyzer.update(frame)
-        flow_smooth = self.flow_analyzer.smoothed()
+        # Throttle Farneback: compute every _flow_skip+1 frames; return cached
+        # smoothed state on skipped frames. Cuts steady-state cost from
+        # ~20 ms/frame to ~4 ms/frame without losing temporal resolution.
+        self._flow_ticker += 1
+        if self._flow_ticker % (self._flow_skip + 1) == 0:
+            self.flow_analyzer.update(frame)
+        flow = self.flow_analyzer.smoothed()
+        flow_smooth = flow
         stampede = self.stampede_det.assess(crowd, flow_smooth)
 
         # Dense-crowd correction: YOLO under-counts above ~30 persons/frame
@@ -882,12 +1173,9 @@ class CameraPipeline:
         }
         update_crowd_state(self.spec.id, state)
 
-        # Annotate live frame with crowd info (shown in MJPEG feed)
-        # Draw crowd overlay on the detection-annotated frame (or raw if not provided)
-        canvas = live_canvas if live_canvas is not None else frame
-        self._annotate_crowd_on_live_frame(canvas, crowd, stampede)
-
-        # Write to DB on warning/critical or every snapshot_interval frames
+        # Write to DB on warning/critical or every snapshot_interval frames.
+        # Submitted to a dedicated 1-thread executor so SQLite writes (~100-300 ms)
+        # don't block the inference thread.
         crowd_needs_snapshot = (
             stampede.level != "ok"
             or crowd.risk_level != "ok"
@@ -895,7 +1183,7 @@ class CameraPipeline:
         )
         if crowd_needs_snapshot and crowd.total_count > 0:
             self._last_snapshot_frame = frame_idx
-            self._persist_crowd_snapshot(crowd, stampede)
+            self._crowd_executor.submit(self._persist_crowd_snapshot, crowd, stampede)
 
         # Push critical stampede event via WS
         if stampede.level == "critical":
@@ -1276,7 +1564,7 @@ class CameraPipeline:
         ]
         events = self.loiter_det.update(persons)
         for ev in events:
-            self._persist_loiter_incident(ev)
+            self._db_executor.submit(self._persist_loiter_incident, ev)
             try:
                 from src.api.server import push_violation_event
                 push_violation_event({
@@ -1302,12 +1590,12 @@ class CameraPipeline:
         objects = self.abandon_det.update(
             frame,
             person_bboxes,
-            object_detections=luggage_dets if luggage_dets else None,
+            object_detections=luggage_dets,
         )
         for obj in objects:
             # Only push/persist every ~30 frames per object centroid
             if frame_idx % 30 == 0:
-                self._persist_abandoned_incident(obj, frame_idx)
+                self._db_executor.submit(self._persist_abandoned_incident, obj, frame_idx)
                 try:
                     from src.api.server import push_violation_event
                     push_violation_event({
@@ -1320,38 +1608,6 @@ class CameraPipeline:
                     })
                 except Exception:
                     pass
-
-    # ----------------------------------------------------- live frame annotator
-
-    def _annotate_crowd_on_live_frame(self, frame: np.ndarray, crowd, stampede) -> None:
-        """Overlay crowd stats on the live MJPEG frame buffer."""
-        try:
-            h, w = frame.shape[:2]
-            overlay = frame.copy()
-            # Semi-transparent dark strip at top
-            cv2.rectangle(overlay, (0, 0), (w, 28), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            level_color = {
-                "ok": (80, 200, 80),
-                "warning": (40, 170, 210),
-                "critical": (50, 50, 220),
-            }.get(stampede.level, (200, 200, 200))
-
-            txt = (
-                f"{self.spec.id}  |  persons:{crowd.total_count}"
-                f"  density:{crowd.max_density:.1f}p/m²"
-                f"  risk:{stampede.level.upper()}"
-            )
-            cv2.putText(frame, txt, (8, 18), font, 0.45, level_color, 1, cv2.LINE_AA)
-
-            # Cache the fully-annotated frame so the stream loop pushes it.
-            # We do NOT push directly here — the stream loop owns MJPEG cadence.
-            with self._latest_annotated_lock:
-                self._latest_annotated = frame
-        except Exception:
-            pass
 
     # ----------------------------------------------------- DB persisters
 
@@ -1509,6 +1765,12 @@ class CameraPipeline:
         self._track_sighting_db_id.pop(tid, None)
         self._track_last_sight_update_frame.pop(tid, None)
         self._plate_consensus.forget(tid)
+        with self._plate_db_lock:
+            self._plate_insert_pending.discard(tid)
+            self._plate_db_results.pop(tid, None)
+        with self._reid_lock:
+            self._reid_pending.pop(tid, None)
+            self._reid_ready.pop(tid, None)
         if self.reid:
             self.reid.forget_track(self.spec.id, tid)
 
@@ -1523,16 +1785,15 @@ class CameraPipeline:
         ocr_conf: float,
         frame: np.ndarray,
     ) -> None:
-        """Persist a per-track plate sighting.
+        """Schedule a non-blocking plate sighting persist.
 
-        One row per (camera, track_id). Subsequent reads of the same
-        track UPDATE that row instead of inserting new ones, so the UI
-        shows ONE plate per car that refines as more frames arrive.
-        Cross-camera match flag is set when the same plate was seen on
-        a different camera in the lookback window.
+        All I/O (JPEG save + SQLite SELECT/INSERT/UPDATE) runs on _db_executor
+        so the inference thread returns in <1 ms. Results are drained back into
+        _track_sighting_db_id at the top of the next frame via
+        _drain_plate_db_results().
         """
         attrs = self._track_attrs.get(td.track_id, (None, None, None))
-        global_id, color, vtype = attrs
+        global_id, color, _ = attrs
 
         existing_id = self._track_sighting_db_id.get(td.track_id)
         text_key = (td.track_id, plate_text)
@@ -1540,11 +1801,7 @@ class CameraPipeline:
         if text_changed:
             self._logged_sightings.add(text_key)
 
-        # Throttle: a track that already has a row gets at most ONE
-        # UPDATE + WS push per second (~30 frames at 30 fps), unless
-        # the OCR text actually changed for it. Without this throttle
-        # 5 cars × 30 fps = 150 DB UPDATEs + WS broadcasts per second
-        # which freezes the dashboard.
+        # Throttle: update at most once per 10-30 frames per track.
         try:
             frame_idx_now = getattr(td, "_frame_idx", None) or self._latest_inference_frame_idx
         except Exception:
@@ -1554,23 +1811,58 @@ class CameraPipeline:
         min_update_gap = 10 if text_changed else 30
         if existing_id is not None and update_gap < min_update_gap:
             return
+
+        # Prevent double-INSERT: if a background INSERT is already in flight
+        # for this track, skip — the row_id will be drained on the next frame.
+        with self._plate_db_lock:
+            if existing_id is None and td.track_id in self._plate_insert_pending:
+                return
+            if existing_id is None:
+                self._plate_insert_pending.add(td.track_id)
+
         self._track_last_sight_update_frame[td.track_id] = frame_idx_now
 
-        plate_crop_path = None
+        # Extract the plate crop NOW (pure numpy, ~0.1 ms) so we don't hold
+        # a reference to the live frame buffer in the background thread.
+        plate_crop: Optional[np.ndarray] = None
         should_refresh_crop = existing_id is None or (text_changed and update_gap >= 30)
         if should_refresh_crop:
+            crop = _crop_padded(frame, plate_det.xyxy, pad=0.40)
+            if crop is not None and crop.size > 0:
+                plate_crop = crop.copy()
+
+        det_cls = str(td.detection.cls.value) if td.detection.cls else None
+        track_id = td.track_id
+
+        self._db_executor.submit(
+            self._persist_plate_sighting_bg,
+            track_id, plate_text, ocr_conf, existing_id,
+            global_id, color, det_cls, plate_crop,
+        )
+
+    def _persist_plate_sighting_bg(
+        self,
+        track_id: int,
+        plate_text: str,
+        ocr_conf: float,
+        existing_id: Optional[int],
+        global_id: Optional[str],
+        color: Optional[str],
+        det_cls: Optional[str],
+        plate_crop: Optional[np.ndarray],
+    ) -> None:
+        """Background worker: JPEG save + SQLite write for one plate sighting."""
+        t0 = time.monotonic()
+
+        plate_crop_path: Optional[str] = None
+        if plate_crop is not None:
             try:
-                # Save the WIDER padded crop (40 % around the bbox) so the
-                # operator can verify the read by eye in the UI. The tight
-                # detector crop is what the OCR sees, but a clipped image
-                # in the evidence column is hard for a human to confirm.
-                crop = _crop_padded(frame, plate_det.xyxy, pad=0.40)
-                if crop is not None and crop.size > 0:
-                    plate_crop_path = self.store.save_plate_crop(plate_text, crop)
+                plate_crop_path = self.store.save_plate_crop(plate_text, plate_crop)
             except Exception:
                 log.debug("plate crop save failed", exc_info=True)
 
         is_match = False
+        row_id: Optional[int] = existing_id
         is_new = False
         try:
             from src.common.db import session_scope
@@ -1592,7 +1884,6 @@ class CameraPipeline:
                 is_match = prior is not None
 
                 if existing_id is not None:
-                    # UPDATE the existing per-track sighting in place
                     row = s.get(PlateSighting, existing_id)
                     if row is not None:
                         row.plate_text = plate_text
@@ -1606,16 +1897,16 @@ class CameraPipeline:
                         s.flush()
                         row_id = row.id
                     else:
-                        existing_id = None    # row vanished; insert a fresh one
+                        existing_id = None
                 if existing_id is None:
                     row = PlateSighting(
                         plate_text=plate_text,
                         camera_id=self.spec.id,
                         timestamp=datetime.utcnow(),
-                        track_id=td.track_id,
+                        track_id=track_id,
                         global_id=global_id,
                         ocr_confidence=ocr_conf,
-                        vehicle_class=str(td.detection.cls.value) if td.detection.cls else None,
+                        vehicle_class=det_cls,
                         vehicle_color=color,
                         plate_crop_path=plate_crop_path,
                         is_cross_camera_match=is_match,
@@ -1623,66 +1914,69 @@ class CameraPipeline:
                     s.add(row)
                     s.flush()
                     row_id = row.id
-                    self._track_sighting_db_id[td.track_id] = row_id
                     is_new = True
         except Exception:
             log.debug("plate sighting persist failed", exc_info=True)
+            with self._plate_db_lock:
+                self._plate_insert_pending.discard(track_id)
             return
 
-        # Push WS event to live surveillance feed
-        try:
-            from src.api.server import push_violation_event
-            push_violation_event({
-                "type": "plate_sighting",
-                "id": row_id,
-                "plate_text": plate_text,
-                "camera_id": self.spec.id,
-                "ocr_confidence": round(ocr_conf, 3),
-                "vehicle_class": str(td.detection.cls.value) if td.detection.cls else None,
-                "is_cross_camera_match": is_match,
-            })
-        except Exception:
-            pass
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        log.debug("[%s] plate-db track=%d %s row=%s text=%s %.0fms",
+                  self.spec.id, track_id,
+                  "INSERT" if is_new else "UPDATE", row_id, plate_text, elapsed_ms)
+
+        # Publish new row_id so _drain_plate_db_results() can update
+        # _track_sighting_db_id on the inference thread (avoids double-INSERT).
+        if is_new and row_id is not None:
+            with self._plate_db_lock:
+                self._plate_db_results[track_id] = row_id
+
+        if row_id is not None:
+            try:
+                from src.api.server import push_violation_event
+                push_violation_event({
+                    "type": "plate_sighting",
+                    "id": row_id,
+                    "plate_text": plate_text,
+                    "camera_id": self.spec.id,
+                    "track_id": track_id,
+                    "ocr_confidence": round(ocr_conf, 3),
+                    "vehicle_class": det_cls,
+                    "is_cross_camera_match": is_match,
+                })
+            except Exception:
+                pass
 
         if is_match:
             log.info("[%s] CROSS-CAMERA MATCH: plate=%s seen previously on different camera",
                      self.spec.id, plate_text)
 
-    def _persist_reid_subject(
+    def _save_violation_bg(
         self,
-        global_id: str,
-        match_sim: float,
-        td: TrackedDetection,
-        color: Optional[str],
-        vtype: Optional[str],
+        ev: "ViolationEvent",
+        frame: np.ndarray,
+        annotated: np.ndarray,
+        plate_crop: Optional[np.ndarray],
     ) -> None:
+        """Background worker: JPEG encode + object-store write + SQLite row for one event."""
         try:
-            from src.common.db import session_scope
-            from src.evidence.models import ReidSubject
-            plate_text, _ = self.rules.best_plate(td.track_id)
-            now = datetime.utcnow()
-            with session_scope() as s:
-                row = s.get(ReidSubject, global_id)
-                if row is None:
-                    row = ReidSubject(
-                        global_id=global_id,
-                        first_seen_at=now,
-                        last_seen_at=now,
-                        camera_ids=[self.spec.id],
-                        plate_text=plate_text,
-                        vehicle_color=color,
-                        vehicle_type=vtype,
-                        match_count=1,
-                    )
-                    s.add(row)
-                else:
-                    row.last_seen_at = now
-                    row.match_count = (row.match_count or 0) + 1
-                    if plate_text and not row.plate_text:
-                        row.plate_text = plate_text
-                    cameras = row.camera_ids or []
-                    if self.spec.id not in cameras:
-                        row.camera_ids = cameras + [self.spec.id]
+            row_id = self.store.save(ev, frame=frame, annotated=annotated, plate_crop=plate_crop)
+        except Exception:
+            log.debug("violation save failed", exc_info=True)
+            return
+        try:
+            from src.api.server import push_violation_event
+            push_violation_event({
+                "type": "violation",
+                "id": row_id,
+                "code": ev.code.value,
+                "camera_id": ev.camera_id,
+                "track_id": ev.track_id,
+                "plate_text": ev.plate_text,
+                "confidence": round(ev.confidence, 3),
+                "extras": ev.extras,
+            })
         except Exception:
             pass
 
@@ -1757,8 +2051,8 @@ class PipelineOrchestrator:
         if torch.cuda.is_available():
             # Allow PyTorch to overlap CPU↔GPU transfers with compute
             torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.benchmark = True
-            log.info("CUDA: %s | TF32+cuDNN benchmark enabled", torch.cuda.get_device_name(0))
+            torch.backends.cudnn.benchmark = False
+            log.info("CUDA: %s | TF32 enabled, cuDNN benchmark OFF", torch.cuda.get_device_name(0))
 
         from src.common.db import engine
         from src.evidence.models import Base
@@ -1870,6 +2164,27 @@ class PipelineOrchestrator:
             dense_trigger_count=int(self.rule_params.get("crowd", {}).get("dense_trigger_count", 30)),
             device=settings.device,
         )
+
+        # Pre-warm violence models NOW, before any camera is added.
+        # VideoMAE (~1.2 GB) and CLIP (~600 MB) each take 10-30 seconds to
+        # load on CUDA. If we wait until the first inference, the loading
+        # thread locks the CUDA context, stalling all other GPU ops (YOLO,
+        # ReID) for 20-30 s. Pre-warming here means cameras start with warm
+        # models and no GPU freeze.
+        if self.clip_clf is not None or self.frame_clf is not None:
+            _clip_ref = self.clip_clf
+            _frame_ref = self.frame_clf
+            def _prewarm_violence() -> None:
+                try:
+                    log.info("Pre-warming violence models (VideoMAE + CLIP) — may take 30-60 s")
+                    if _clip_ref is not None:
+                        _clip_ref._load_model()
+                    if _frame_ref is not None:
+                        _frame_ref._ensure_loaded()
+                    log.info("Violence model pre-warm done — GPU ready")
+                except Exception:
+                    log.warning("Violence model pre-warm failed (non-fatal)", exc_info=True)
+            threading.Thread(target=_prewarm_violence, daemon=True, name="model-prewarm").start()
 
         # Expose globally so API can call add/remove camera
         global _shared_orchestrator

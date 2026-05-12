@@ -237,13 +237,13 @@ class Detector:
         if not crops:
             return []
 
-        # Single batched inference — YOLO accepts a list of images
-        results = self.helmet.predict(crops, device=self.device, conf=self.conf, verbose=False, half=self._half)
-
         out: list[Detection] = []
         seen: set[tuple] = set()  # deduplicate by (cls, rounded_box)
 
-        for res, (ox, oy) in zip(results, offsets):
+        # Single-batch inference with dynamic sizes causes PyTorch memory thrashing
+        # and 10+ second delays when the number of riders changes. We run crops sequentially.
+        for crop, (ox, oy) in zip(crops, offsets):
+            res = self.helmet.predict(crop, device=self.device, conf=self.conf, verbose=False, half=self._half)[0]
             for det in self._parse_helmet_results(res):
                 bx1, by1, bx2, by2 = det.xyxy
                 fx1, fy1 = float(bx1) + ox, float(by1) + oy

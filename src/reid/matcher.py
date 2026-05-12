@@ -101,6 +101,48 @@ class CrossCameraReID:
             )
             return global_id, 0.0, None
 
+    def is_due(self, camera_id: str, track_id: int, frame_idx: int) -> bool:
+        """Return True if this track needs a fresh DINOv2 embedding."""
+        key = (camera_id, track_id)
+        with self._lock:
+            last = self._last_frame.get(key, -self.extract_every_n - 1)
+            return (frame_idx - last) >= self.extract_every_n
+
+    def mark_extracting(self, camera_id: str, track_id: int, frame_idx: int) -> None:
+        """Reserve this (camera, track) slot so no second extraction is queued."""
+        with self._lock:
+            self._last_frame[(camera_id, track_id)] = frame_idx
+
+    def process_embedding(
+        self,
+        embedding: np.ndarray,
+        camera_id: str,
+        track_id: int,
+        plate_text: Optional[str] = None,
+        vehicle_color: Optional[str] = None,
+        vehicle_type: Optional[str] = None,
+    ) -> tuple[Optional[str], float, Optional[str]]:
+        """Store/search a pre-computed embedding. Thread-safe."""
+        matches = self.store.search(embedding, exclude_camera=camera_id, top_k=1)
+        propagated_plate: Optional[str] = None
+        if matches:
+            cam_id, t_id, sim, matched_gid = matches[0]
+            if not plate_text:
+                matched_entry = self.store.get_by_camera_track(cam_id, t_id)
+                if matched_entry and matched_entry.plate_text:
+                    propagated_plate = matched_entry.plate_text
+            global_id = self.store.add_or_update(
+                embedding, camera_id, track_id, plate_text,
+                vehicle_color, vehicle_type, global_id=matched_gid,
+            )
+            return global_id, sim, propagated_plate
+        else:
+            global_id = self.store.add_or_update(
+                embedding, camera_id, track_id, plate_text,
+                vehicle_color, vehicle_type,
+            )
+            return global_id, 0.0, None
+
     def forget_track(self, camera_id: str, track_id: int) -> None:
         with self._lock:
             self._last_frame.pop((camera_id, track_id), None)
